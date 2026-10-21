@@ -1,0 +1,44 @@
+# The same three-node tembo cluster as in docker-compose.yaml, but with
+# Consul service discovery instead of the static --peers list. Run the two
+# files together:
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.ext.yaml up -d
+#
+# Every node registers itself in Consul (service "tembo", a TCP health check
+# against its API port) and discovers the peers from the catalog. The node
+# ids are the same as in the base file — tembo_a, tembo_b, tembo_c, from the
+# hostnames — and travel in the tembo_id metadata. --consul-expect 3 makes
+# each node wait for the full set before bootstrapping; the advertise
+# address is the default, the hostname at port 8001, which the service
+# names resolve to. Nodes added later join with `tembo members add` as
+# usual; see docs/operations.md (Consul discovery).
+
+services:
+  consul:
+    image: hashicorp/consul:1.21
+    command: agent -dev -client=0.0.0.0
+    ports:
+      - "8500:8500" # UI / API
+    healthcheck:
+      test: [ "CMD", "consul", "members" ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  tembo-a:
+    depends_on:
+      consul:
+        condition: service_healthy
+    command: [ run, --consul, "http://consul:8500", --consul-expect, "3" ]
+
+  tembo-b:
+    depends_on:
+      consul:
+        condition: service_healthy
+    command: [ run, --consul, "http://consul:8500", --consul-expect, "3" ]
+
+  tembo-c:
+    depends_on:
+      consul:
+        condition: service_healthy
+    command: [ run, --consul, "http://consul:8500", --consul-expect, "3" ]

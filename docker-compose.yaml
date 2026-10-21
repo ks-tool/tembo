@@ -1,0 +1,82 @@
+# A local three-node tembo cluster. The image is built from the Dockerfile
+# (tembo:local); postgres:18-alpine supplies the Postgres binaries.
+#
+#   docker compose up --build
+#
+# With Consul service discovery instead of this static --peers list:
+#   docker compose -f docker-compose.yaml -f docker-compose.ext.yaml up -d
+#
+# The nodes name themselves after their hosts: with --peers in the bare
+# host:port form and hostname equal to the service name, node ids are
+# tembo_a, tembo_b, tembo_c — no --id needed. (Slots: tembo_tembo_a, …)
+#
+# Connect:   writes  localhost:5432  (node a's write proxy; b's on 5433, c's on 5436)
+#             reads   localhost:5434  (node a's read proxy; b's on 5435, c's on 5438)
+# CLI:       docker compose exec tembo-a tembo status
+#            (or from the host: go build -o tembo . && tembo --addr localhost:8001 status)
+#
+# The Postgres superuser password comes from TEMBO_PG_PASSWORD (default
+# "tembo") — the same value on every node is a cluster requirement. Rotate it
+# later with:  docker compose exec tembo-a tembo rotate-password
+#
+# The postgres image's own entrypoint normally drops privileges to the
+# postgres user; tembo replaces it, so the user is set here — the agent's
+# default local authentication is peer over the Unix socket.
+
+x-node-env: &node-env
+  TEMBO_PG_PASSWORD: ${TEMBO_PG_PASSWORD:-tembo}
+  TEMBO_PG_DATA: /var/lib/postgresql/data
+  TEMBO_DB: /var/lib/postgresql/tembo.db
+
+x-node: &node
+  build: .
+  image: tembo:local
+  user: postgres
+  stop_grace_period: 1m # a clean Postgres stop may take up to its shutdown timeout
+  environment: *node-env
+  command:
+    - run
+    - --peers
+    - tembo-a:8001,tembo-b:8001,tembo-c:8001
+  healthcheck:
+    test: [ "CMD", "tembo", "health" ] # 200 only while the local Postgres answers SQL
+    interval: 10s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
+
+services:
+  tembo-a:
+    <<: *node
+    hostname: tembo-a
+    volumes:
+      - tembo-a:/var/lib/postgresql
+    ports:
+      - "8001:8001" # API / metrics
+      - "5432:5432" # write proxy
+      - "5434:5434" # read proxy
+
+  tembo-b:
+    <<: *node
+    hostname: tembo-b
+    volumes:
+      - tembo-b:/var/lib/postgresql
+    ports:
+      - "8002:8001"
+      - "5433:5432"
+      - "5435:5434"
+
+  tembo-c:
+    <<: *node
+    hostname: tembo-c
+    volumes:
+      - tembo-c:/var/lib/postgresql
+    ports:
+      - "8003:8001"
+      - "5436:5432"
+      - "5438:5434"
+
+volumes:
+  tembo-a:
+  tembo-b:
+  tembo-c:
