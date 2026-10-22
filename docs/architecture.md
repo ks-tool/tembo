@@ -27,19 +27,24 @@ One `tembo run` process per node. Everything a node is made of:
                 └────────────────────────────────────────────────┘
 ```
 
+Without `--peers` and `--consul` the same process runs standalone: no
+`raft.Node`, no `/raft/*`, `/switchover`, `/failover` and `/members`
+endpoints — the node is always the leader and the primary, and writes that
+would go through the log apply to the store directly.
+
 ## Packages
 
-| Package        | Responsibility                                                                                                                                                                                                                                                                                   |
-|----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `pkg/raft`     | Minimal Raft: elections, log replication, joint-consensus membership changes, compaction, snapshot install. Transport-agnostic.                                                                                                                                                                  |
-| `pkg/store`    | The bbolt file: the replicated key/value state machine (`Apply`), the raft log/term/vote storage, snapshots of the KV as JSON.                                                                                                                                                                   |
-| `pkg/agent`    | `Server` — glues raft + store + HTTP together; the `Watch` poll loop that detects failures and carries out switchover/failover; the CLI-facing handlers; agent metrics.                                                                                                                          |
-| `pkg/postgres` | `Instance` — everything about the local Postgres: initdb/clone/rewind, configuration files, promote/stop, slots, sync-standby names, status SQL. `run.go` — the `run` command and the node's control loops. Also the rest of the CLI, the Kubernetes and Consul integrations, log FIFO handling. |
-| `pkg/proxy`    | Plain TCP forwarding with swappable target lists and an address allowlist.                                                                                                                                                                                                                       |
-| `pkg/auth`     | API authentication: JWT, SPNEGO (Kerberos), LDAP Basic, mTLS; read-only identities.                                                                                                                                                                                                              |
-| `pkg/metrics`  | The postgres_exporter collector set over pgx (namespace `pg`).                                                                                                                                                                                                                                   |
-| `pkg/addrlist` | IP/CIDR/hostname address lists — the same list `pg_hba.conf` is written from gates the API and the proxies.                                                                                                                                                                                      |
-| `pkg/exec`     | `os/exec` wrappers: line-by-line output capture, per-command environment, cancellation signals, `Pdeathsig` on Linux.                                                                                                                                                                            |
+| Package             | Responsibility                                                                                                                                                                                                                                                                                                                                                                           |
+|---------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `internal/raft`     | Minimal Raft: elections, log replication, joint-consensus membership changes, compaction, snapshot install. Transport-agnostic.                                                                                                                                                                                                                                                          |
+| `internal/store`    | The bbolt file: the replicated key/value state machine (`Apply`), the raft log/term/vote storage, snapshots of the KV as JSON.                                                                                                                                                                                                                                                           |
+| `internal/agent`    | `Server` — glues raft + store + HTTP together; the `Watch` poll loop that detects failures and carries out switchover/failover; the handlers of `/status`, `/switchover`, `/failover`, `/members`, `/raft/*`; agent metrics.                                                                                                                                                             |
+| `internal/postgres` | `Instance` — everything about the local Postgres: initdb/clone/rewind, configuration files, promote/stop, slots, sync-standby names, status SQL. `run.go` — the `run` command and the node's control loops. Also the CLI-facing HTTP handlers (`/config`, `/settings`, `/password`, `/health`, the ops), the rest of the CLI, the Kubernetes and Consul integrations, log FIFO handling. |
+| `internal/proxy`    | Plain TCP forwarding with swappable target lists and an address allowlist.                                                                                                                                                                                                                                                                                                               |
+| `internal/auth`     | API authentication: JWT, SPNEGO (Kerberos), LDAP Basic, mTLS; read-only identities.                                                                                                                                                                                                                                                                                                      |
+| `internal/metrics`  | The postgres_exporter collector set over pgx (namespace `pg`).                                                                                                                                                                                                                                                                                                                           |
+| `internal/addrlist` | IP/CIDR/hostname address lists — the same list `pg_hba.conf` is written from gates the API and the proxies.                                                                                                                                                                                                                                                                              |
+| `internal/exec`     | `os/exec` wrappers: line-by-line output capture, per-command environment, cancellation signals, `Pdeathsig` on Linux.                                                                                                                                                                                                                                                                    |
 
 ## The replicated state machine
 
@@ -53,6 +58,7 @@ The store is a key/value space raft replicates. The keys tembo uses:
 | `switchover`    | The target node of a pending switchover                                | `PUT /switchover/{id}`                                                 |
 | `switchover_at` | When a scheduled switchover runs (RFC3339)                             | `PUT /switchover/{id}` with a body                                     |
 | `history`       | Failover/switchover history, a JSON object of timestamp → event        | Leader, on every event                                                 |
+| `password`      | The cluster's Postgres password (never returned by any GET)            | `PUT /password`                                                        |
 
 Commands (`set`, `add`, `del`, `merge` — see [consensus.md](consensus.md))
 travel through the raft log as JSON and are applied on every node. A
@@ -61,7 +67,11 @@ follower's copy may briefly lag the leader's.
 ## Control loops
 
 All loops tick once a second (`route`, `reconcile`, `Watch`, the allowlist
-watcher) or at raft's heartbeat interval (50 ms). They communicate only
+watcher, `leaveWhenRemoved` — which stops the agent, and with it Postgres,
+once the cluster has dropped the node) or at raft's heartbeat interval (50 ms); with `--k8s`, `kubeWatch`
+applies the objects as the informers report them and re-applies the latest
+set when the node becomes the raft leader.
+They communicate only
 through the replicated store, `Server`'s polls and the `Instance` — never
 through direct RPCs to each other, so a busy loop never blocks another.
 
@@ -95,8 +105,8 @@ Brings the local Postgres in line with the cluster state once a second:
    since its start) is left alone. `supervise` restarts it.
 3. Publishes the state (running, LSN, sync standbys, node tags, config hash,
    config errors) to `Server.SetPostgres` — this is what `Watch` polls.
-4. Rewrites `pg_hba.conf` when the membership or the `hba` setting changed (checked every tick after a change, every 30
-   ticks otherwise).
+4. Rewrites `pg_hba.conf` when the membership or the `hba` setting changed 
+   (checked every tick after a change, every 30 ticks otherwise).
 5. On the primary: ensures the `tembo_repl` role, one physical replication
    slot per other node, and `synchronous_standby_names` following the
    standbys that actually stream.
@@ -138,8 +148,8 @@ This is the same list `pg_hba.conf` is written from; see
 
 ### The log drains
 
-Postgres logs through its `logging_collector` into two FIFOs (`/tmp/tembo-<id>/postgres` and `postgres.csv`) that the
-agent created and
+Postgres logs through its `logging_collector` into two FIFOs 
+(`/tmp/tembo-<id>/postgres` and `postgres.csv`) that the agent created and
 holds open. Two readers turn them into the agent's JSON log: plain lines
 verbatim, CSV records parsed into fields with their severity mapped. The
 FIFOs are the only pipe; if a reader dies the 64 KB FIFO fills, the logging
@@ -152,8 +162,8 @@ Postgres. See [postgres-management.md](postgres-management.md#logging).
 
 - Each node's Postgres state is re-published every second; the leader polls
   everyone every second.
-- The **primary fences itself** when it has not seen a quorum for 5 s (`fenceTimeout`): reconcile stops Postgres
-  immediately. This is what makes
+- The **primary fences itself** when it has not seen a quorum for 5 s 
+  (`fenceTimeout`): reconcile stops Postgres immediately. This is what makes
   failover safe — by the time the leader replaces the primary (after 15 s,
   `failoverTimeout`), an isolated primary has already stopped accepting
   writes.
@@ -162,4 +172,4 @@ Postgres. See [postgres-management.md](postgres-management.md#logging).
 - The **proxies refuse clients** while the node sees no quorum or a switchover
   is in progress, so traffic never reaches a fenced primary.
 
-Timings are constants in `pkg/agent/watch.go` and `pkg/postgres/run.go`.
+Timings are constants in `internal/agent/watch.go` and `internal/postgres/run.go`.

@@ -91,6 +91,18 @@ func (s *Store) Apply(e raft.Entry) {
 	}
 }
 
+// ApplyCommand applies cmd directly, without a raft entry: the standalone
+// mode has no log to go through.
+func (s *Store) ApplyCommand(cmd Command) error {
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return applyCommand(tx.Bucket(bucketKV), data)
+	})
+}
+
 func applyCommand(kv *bolt.Bucket, data []byte) error {
 	var cmd Command
 	if err := json.Unmarshal(data, &cmd); err != nil {

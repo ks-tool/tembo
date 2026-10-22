@@ -12,8 +12,10 @@ day-2 operations.
 ## What it does
 
 - **Failover and switchover.** Automatic failover ~15 s after the primary
-  dies, preferring the standby with the most WAL under the
-  `max-lag-on-failover` limit (1 MB by default); zero-loss switchover by
+  dies: among the standbys under the `max-lag-on-failover` limit (1 MB by
+  default) the candidate is picked by `--failover-priority`, then by having
+  been a synchronous standby of the primary, then by the most WAL;
+  zero-loss switchover by
   shutdown LSN; scheduled switchover; manual failover, including while
   paused. Fencing: a primary without a quorum stops Postgres within ~5 s,
   and the postmaster dies with its agent (Pdeathsig SIGQUIT).
@@ -25,7 +27,8 @@ day-2 operations.
   restarts.
 - **Configuration.** A cluster-wide `postgresql.conf` validated against a
   real Postgres and rolled out one node at a time (standbys, then the
-  primary); `synchronous_standby_names` is managed by the agent. Optionally
+  primary — a change that lowers a hot-standby limit goes to the primary
+  first); `synchronous_standby_names` is managed by the agent. Optionally
   sourced from Kubernetes ConfigMaps/Secrets (`--k8s`) or discovered through
   Consul instead of `--peers`.
 - **Access.** TCP proxies: `--listen` forwards to the primary, `--listen-ro`
@@ -53,6 +56,14 @@ Clients connect to `a:5432` (writes) and `a:5434` (reads); the CLI is
 `tembo --addr 10.0.0.1:8001 status`. Adding a node to a live cluster:
 start it with `--join` and `--peers d=10.0.0.4:8001,a=10.0.0.1:8001`, then
 `tembo members add d=10.0.0.4:8001`.
+
+A single node without high availability runs standalone — drop `--peers` and
+`--consul`, and there is no raft: the node is the primary from the start and
+configuration writes apply locally:
+
+```sh
+TEMBO_PG_PASSWORD=... tembo run --id solo --pg-data /var/lib/postgresql/solo
+```
 
 ## Limitations
 

@@ -8,6 +8,9 @@ Postgres. A scrape takes one Postgres connection and is bounded by a
 
 ## Agent and raft metrics
 
+The `tembo_raft_*` series exist only with a raft cluster; a standalone node
+(no `--peers`, no `--consul`) reports the `tembo_agent_*` ones alone.
+
 | Metric                                    | Type  | Labels                              | Meaning                                                                                                                                                                                                                                                                   |
 |-------------------------------------------|-------|-------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `tembo_raft_state`                        | gauge | `state` = follower/candidate/leader | 1 for the role this node plays now, 0 for the others.                                                                                                                                                                                                                     |
@@ -66,16 +69,19 @@ Each collector also reports:
 
 - `pg_scrape_collector_duration_seconds{collector=...}`
 - `pg_scrape_collector_success{collector=...}` — 0 when a collector failed (e.g. `stat_statements` without the
-  extension, `buffercache` without
-  `pg_buffercache`); a failed collector never fails the scrape.
+  extension, `buffercache_summary` on PG16+ without `pg_buffercache`); a failed collector never fails the scrape.
 
 Pre-PG13 query variants are not included; tembo does not support those
 servers. Extension-dependent collectors fail soft with
-`pg_scrape_collector_success 0`.
+`pg_scrape_collector_success 0` — except `buffercache_summary` on PG13–15,
+where `pg_buffercache_summary()` does not exist: there it reports success 1
+and simply yields no metrics.
 
 ## Scraping
 
 Scrape every node's API port — each reports its own raft state and its own
 Postgres. A node whose Postgres is down still serves `/metrics` (the `pg_*`
 part yields nothing but a fresh connection failure; the `tembo_*` part keeps
-working).
+working). `/metrics` goes through the same authentication as the rest of the
+API: when it is configured, a scraper outside the cluster's own addresses
+needs credentials — only the loopback and the nodes are exempt ([security.md](security.md#api-authentication)).

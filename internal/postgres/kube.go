@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	appconfig "github.com/ks-tool/app-config/go"
 	"github.com/ks-tool/app-config/go/k8s"
@@ -63,40 +62,43 @@ func kubeClient() (*k8s.Client, error) {
 	return nil, err
 }
 
-// kubeWatch keeps the cluster's configuration in line with the Kubernetes
+// kubeWatcher keeps the cluster's configuration in line with the Kubernetes
 // objects of --k8s: their config.json and settings.json are the desired
 // postgresql.conf settings and agent settings. Only the raft leader writes;
-// every node watches, so a new leader picks the state up. The latest set is
-// applied on a timer too: the first change may arrive before the leader is
-// elected, and a new leader sees no change at all.
-func kubeWatch(ctx context.Context, kube *k8s.Client, srv *agent.Server, st *store.Store, pg *Instance) {
-	var mu sync.Mutex
-	var last map[string]string
-	apply := func() {
-		mu.Lock()
-		kv := last
-		mu.Unlock()
-		if kv != nil {
-			kubeApply(ctx, srv, st, pg, kv)
-		}
+// every node watches, so a new leader picks the state up.
+type kubeWatcher struct {
+	srv  *agent.Server
+	st   *store.Store
+	pg   *Instance
+	mu   sync.Mutex
+	last map[string]string // the newest set the informers reported
+}
+
+func newKubeWatcher(srv *agent.Server, st *store.Store, pg *Instance) *kubeWatcher {
+	return &kubeWatcher{srv: srv, st: st, pg: pg}
+}
+
+// apply proposes the newest reported set, if any. It is the OnLeaderChange
+// callback too: a change that arrived while this node was not the leader is
+// not replayed by the informers, so gaining leadership re-applies it.
+func (w *kubeWatcher) apply(ctx context.Context) {
+	w.mu.Lock()
+	kv := w.last
+	w.mu.Unlock()
+	if kv != nil {
+		kubeApply(ctx, w.srv, w.st, w.pg, kv)
 	}
-	go func() {
-		t := time.NewTicker(15 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				apply()
-			}
-		}
-	}()
+}
+
+// watch feeds the informers' changes in: onChange fires once they have
+// synced and on every change of the ConfigMaps and Secrets of --k8s, so no
+// re-apply on a timer is needed.
+func (w *kubeWatcher) watch(ctx context.Context, kube *k8s.Client) {
 	err := kube.Watch(ctx, rc.K8s, func(kv map[string]string) {
-		mu.Lock()
-		last = kv
-		mu.Unlock()
-		apply()
+		w.mu.Lock()
+		w.last = kv
+		w.mu.Unlock()
+		w.apply(ctx)
 	})
 	if err != nil && ctx.Err() == nil {
 		log.Error().Err(err).Msg("kubernetes watch")

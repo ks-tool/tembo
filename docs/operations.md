@@ -2,6 +2,9 @@
 
 ## Membership changes on a live cluster
 
+`tembo members list` prints the membership in effect — the voters, plus the
+joint set while a change is settling.
+
 Adding a node (details in [getting-started.md](getting-started.md)):
 
 1. Start the new agent with `--join`, `--peers` naming itself and at least
@@ -94,8 +97,8 @@ underscores). Inside a pod the in-cluster service account is used; outside,
 
 While `--k8s` is on, `PATCH /config` and `PATCH /settings` answer 403: the
 objects are the desired state. Only the raft leader writes; every node
-watches the objects (and re-applies every 15 s), so a new leader picks the
-state up. Values are validated on the leader before they are proposed. A
+watches the objects (and re-applies the latest set on becoming the leader),
+so a new leader picks the state up. Values are validated on the leader before they are proposed. A
 key the object drops releases that part of the configuration back to the
 defaults.
 
@@ -171,8 +174,9 @@ Or on the same membership: `reinit` reclones just the data directory.
    failed — the case that also *triggers* a shutdown by itself, see
    [postgres-management.md](postgres-management.md#logging)).
 
-A third signal falls through to the default action. `SIGHUP` is ignored
-entirely. The postmaster always carries `Pdeathsig SIGQUIT`: whatever kills
+Signals beyond that are dropped — the hurry channel buffers one signal and
+`signal.Notify` never blocks; the immediate stop fires once. `SIGHUP` is
+ignored entirely. The postmaster always carries `Pdeathsig SIGQUIT`: whatever kills
 the agent — crash, `kill -9`, a panic — takes Postgres down with it, and it
 recovers on the next start. systemd unit writers: `KillMode=control-group`
 is fine; do not use `KillMode=process`.
@@ -189,12 +193,14 @@ Events worth knowing on sight:
 
 - `no quorum, stopping postgres` — fencing; the proxies stop forwarding at
   the same time.
-- `failover: primary is down` / `failover: a → b (requested)` — the leader
-  replaced the primary (automatic / manual).
+- `failover: primary is down` / `failover: requested` — the leader replaced
+  the primary (automatic / manual); both are also recorded in `history` as
+  `failover: a → b` / `failover: a → b (requested)`.
 - `switchover: primary stopped, promoting target` — the zero-loss handover
   moment.
-- `switchover: … abandoned: timed out` / `abandoned: target is not a running
-  standby` — the request was dropped; check the target.
+- `switchover: timed out, giving up` / `switchover: target is not a running
+  standby, giving up` — the request was dropped; check the target. The
+  `history` entry reads `switchover: a → b abandoned: …`.
 - `pg_rewind keeps failing, discarding the data directory to clone the
   primary` — after 10 failures the node reclones itself.
 - `the cluster dropped this node, exiting` — removal reaching the node.
@@ -205,11 +211,12 @@ Events worth knowing on sight:
 
 ## Troubleshooting quick reference
 
-| Symptom                          | Where to look                                                                                                                 |
-|----------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
-| Clients refused on `:5432`       | `status`: no quorum? pending switchover? primary in recovery? All three blank the proxy targets on purpose.                   |
-| `switchover` answers 504         | The leader's log: the primary never stopped, or the target never caught up (its LSN vs the primary's `shutdown_lsn`).         |
-| A standby will not rejoin        | `pg_rewind` errors in its log; after 10 failures it reclones on its own, or force it with `reinit`.                           |
-| Configuration stuck              | `GET /config`: `nodes` shows who has not applied the hash and their `config_error`.                                           |
-| Election storm after a partition | Expected without pre-vote; it settles. A node stuck campaigning while removed should not happen — check its `members` output. |
-| API answers 403                  | The client's address is not on the allowlist — loopback, cluster nodes, or the `hba` setting's addresses.                     |
+| Symptom                               | Where to look                                                                                                                                                                           |
+|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Clients refused on `:5432`            | `status`: no quorum? pending switchover? primary in recovery? All three blank the proxy targets on purpose.                                                                             |
+| `switchover` answers 504              | The leader's log: the primary never stopped, or the target never caught up (its LSN vs the primary's `shutdown_lsn`).                                                                   |
+| A standby will not rejoin             | `pg_rewind` errors in its log; after 10 failures it reclones on its own, or force it with `reinit`.                                                                                     |
+| Configuration stuck                   | `GET /config`: `nodes` shows who has not applied the hash and their `config_error`.                                                                                                     |
+| Election storm after a partition      | Expected without pre-vote; it settles. A node stuck campaigning while removed should not happen — check its `members` output.                                                           |
+| A failover picked the "wrong" standby | The candidate order is `--failover-priority`, then a former synchronous standby of the primary, then the most WAL (bounded by `max-lag-on-failover`) — steer it with the priority flag. |
+| API answers 403                       | The client's address is not on the allowlist — loopback, cluster nodes, or the `hba` setting's addresses.                                                                               |

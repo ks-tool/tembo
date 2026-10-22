@@ -34,27 +34,28 @@ type agentMetrics struct{ s *Server }
 func (agentMetrics) Describe(chan<- *prometheus.Desc) {}
 
 func (m agentMetrics) Collect(ch chan<- prometheus.Metric) {
-	n := m.s.node
-	stats := n.Stats()
-	state := n.State()
-	for _, st := range []raft.State{raft.Follower, raft.Candidate, raft.Leader} {
-		v := 0.0
-		if state == st {
-			v = 1
+	if n := m.s.node; n != nil { // nil in standalone: no raft to report
+		stats := n.Stats()
+		state := n.State()
+		for _, st := range []raft.State{raft.Follower, raft.Candidate, raft.Leader} {
+			v := 0.0
+			if state == st {
+				v = 1
+			}
+			ch <- prometheus.MustNewConstMetric(raftStateDesc, prometheus.GaugeValue, v, st.String())
 		}
-		ch <- prometheus.MustNewConstMetric(raftStateDesc, prometheus.GaugeValue, v, st.String())
-	}
-	ch <- prometheus.MustNewConstMetric(raftTermDesc, prometheus.GaugeValue, float64(n.Term()))
-	if leader := n.Leader(); leader != "" {
-		ch <- prometheus.MustNewConstMetric(raftLeaderDesc, prometheus.GaugeValue, 1, leader)
-	}
-	ch <- prometheus.MustNewConstMetric(raftCommitDesc, prometheus.GaugeValue, float64(stats.CommitIndex))
-	ch <- prometheus.MustNewConstMetric(raftAppliedDesc, prometheus.GaugeValue, float64(stats.Applied))
-	ch <- prometheus.MustNewConstMetric(raftLastDesc, prometheus.GaugeValue, float64(stats.LastIndex))
-	members := n.CommittedMembership()
-	ch <- prometheus.MustNewConstMetric(raftMembersDesc, prometheus.GaugeValue, float64(len(members.Voters)), "voters")
-	if members.Joint != nil {
-		ch <- prometheus.MustNewConstMetric(raftMembersDesc, prometheus.GaugeValue, float64(len(members.Joint)), "joint")
+		ch <- prometheus.MustNewConstMetric(raftTermDesc, prometheus.GaugeValue, float64(n.Term()))
+		if leader := n.Leader(); leader != "" {
+			ch <- prometheus.MustNewConstMetric(raftLeaderDesc, prometheus.GaugeValue, 1, leader)
+		}
+		ch <- prometheus.MustNewConstMetric(raftCommitDesc, prometheus.GaugeValue, float64(stats.CommitIndex))
+		ch <- prometheus.MustNewConstMetric(raftAppliedDesc, prometheus.GaugeValue, float64(stats.Applied))
+		ch <- prometheus.MustNewConstMetric(raftLastDesc, prometheus.GaugeValue, float64(stats.LastIndex))
+		members := n.CommittedMembership()
+		ch <- prometheus.MustNewConstMetric(raftMembersDesc, prometheus.GaugeValue, float64(len(members.Voters)), "voters")
+		if members.Joint != nil {
+			ch <- prometheus.MustNewConstMetric(raftMembersDesc, prometheus.GaugeValue, float64(len(members.Joint)), "joint")
+		}
 	}
 
 	quorum := 0.0

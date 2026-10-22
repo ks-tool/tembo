@@ -1,7 +1,8 @@
 # High availability
 
 The HA rules are deliberately few and time-based. All numbers are constants
-in `pkg/agent/watch.go`:
+in `internal/agent/watch.go` (`switchoverTimeout` in
+`internal/agent/switchover.go`):
 
 | Constant            | Value | Meaning                                                                       |
 |---------------------|-------|-------------------------------------------------------------------------------|
@@ -20,7 +21,9 @@ leader at all:
   nodes within the last `fenceTimeout` (`HasQuorum`).
 - The moment a primary loses that (partition, raft leadership lost, majority
   of agents down), its next reconcile tick — at most a second later — stops
-  Postgres with `--mode immediate`: no checkpoint, WAL flushed, at once.
+  Postgres with `--mode immediate`: no checkpoint and no promised WAL
+  shipment, so the next start runs crash recovery. (Contrast with the clean
+  `fast` stop of a switchover below.)
 - The kernel backstop: the postmaster runs with `Pdeathsig SIGQUIT`, so if
   the agent itself dies, Postgres dies with it. Nothing runs unfenced.
 - While a node has no quorum, both of its proxies refuse connections, and
@@ -36,12 +39,14 @@ The raft leader's `Watch` loop, every second:
 
 1. It is the leader, has a quorum, and has applied everything committed
    before its election (`Ready`) — otherwise it does nothing.
-2. The cluster is not `paused`.
-3. The primary's Postgres has not answered a poll as running for
+2. No switchover is pending: while the `switchover` key sits in the store,
+   the tick is spent carrying it out and the failover path is never reached.
+3. The cluster is not `paused`.
+4. The primary's Postgres has not answered a poll as running for
    `failoverTimeout`, and this leader has been leader that long too (a new
    leader must watch for a full timeout; what the previous leader saw is
    lost).
-4. A candidate is chosen:
+5. A candidate is chosen:
 
     - running, in recovery (a standby), and not tagged `nofailover`;
     - not missing more WAL than `max-lag-on-failover` (1 MB by default, `0`
@@ -53,7 +58,7 @@ The raft leader's `Watch` loop, every second:
 
    With no candidate at all, the leader logs the reason and keeps waiting.
 
-5. `primary` is set to the winner through raft. The winner's next reconcile
+6. `primary` is set to the winner through raft. The winner's next reconcile
    tick sees itself primary-but-in-recovery and runs `pg_ctl promote`. The
    old primary, when it comes back, finds `standby.signal` missing, runs
    `pg_rewind` against the new primary and rejoins as a standby.
@@ -61,7 +66,10 @@ The raft leader's `Watch` loop, every second:
 The promotion itself takes another second or two (the reconcile tick plus
 `pg_ctl promote`), so the observed failover time is ~15–20 s from the primary
 becoming unreachable. If the primary's *agent* was merely cut off but its
-Postgres alive, it fences itself within 5 s and reappears as a standby.
+Postgres alive, it fences itself within ~5–6 s (the 5-second quorum freshness
+window plus up to one reconcile tick) and reappears as a standby. A node that
+finds itself dropped from the membership (`members remove`) likewise stops
+its Postgres and exits on its own — see `leaveWhenRemoved`.
 
 Synchronous replication changes what a failover may lose: with
 `synchronous_mode` on and the promoted standby in the sync set, committed

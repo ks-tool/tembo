@@ -47,31 +47,35 @@ present a client certificate. An `--addr` without a scheme is assumed
 
 ## API authentication
 
-Enabled by any of the `--auth-*` flags. Cluster nodes and the loopback are
+Enabled by any of the `--auth-*` flags — or by `--tls-ca-file` alone, which
+turns mTLS on. Cluster nodes and the loopback are
 exempt — the allowlist already restricts them; every other address must
 authenticate. Supported mechanisms, checked by the credential the request
 carries:
 
-| Mechanism | Request carries                     | Identity           | Enabled by                                                                                                                                                                                                        |
-|-----------|-------------------------------------|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| JWT       | `Authorization: Bearer <token>`     | `jwt:<subject>`    | `--auth-jwt-key-file` (PEM public key RS*/ES* or HMAC secret HS*) or `--auth-jwt-jwks` (a JWKS URL; refetched when a token names an unknown `kid`); `--auth-jwt-issuer`/`--auth-jwt-audience` optionally required |
-| Kerberos  | `Authorization: Negotiate <spnego>` | `krb5:<principal>` | `--auth-krb5-keytab` (the API's own principal)                                                                                                                                                                    |
-| LDAP      | `Authorization: Basic ...`          | `ldap:<username>`  | `--auth-ldap-url`; bind either directly (`--auth-ldap-dn-template "cn=%s,ou=users,dc=example,dc=com"`) or through a search (`--auth-ldap-bind-dn`/`-bind-password-file`/`-base-dn`/`-filter "(uid=%s)"`)          |
-| mTLS      | the TLS handshake                   | `cert:<CN>`        | `--tls-ca-file` (a verified client certificate chain)                                                                                                                                                             |
+| Mechanism | Request carries                     | Identity             | Enabled by                                                                                                                                                                                                        |
+|-----------|-------------------------------------|----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| JWT       | `Authorization: Bearer <token>`     | `jwt:<subject>`      | `--auth-jwt-key-file` (PEM public key RS*/ES*/Ed25519 or HMAC secret HS*) or `--auth-jwt-jwks` (a JWKS URL; refetched when a token names an unknown `kid`); `--auth-jwt-issuer`/`--auth-jwt-audience` optionally required |
+| Kerberos  | `Authorization: Negotiate <spnego>` | `krb5:<principal>`   | `--auth-krb5-keytab` (the API's own principal)                                                                                                                                                                    |
+| LDAP      | `Authorization: Basic ...`          | `ldap:<bound DN>`    | `--auth-ldap-url`; bind either directly (`--auth-ldap-dn-template "cn=%s,ou=users,dc=example,dc=com"`) or through a search (`--auth-ldap-bind-dn`/`-bind-password-file`/`-base-dn`/`-filter "(uid=%s)"`)          |
+| mTLS      | the TLS handshake                   | `cert:<CN>`          | `--tls-ca-file` (a verified client certificate chain; the identity is the certificate's CN, or its first DNS SAN when the CN is empty)                                                                            |
 
 A request with no recognized credential is answered 401 with a
-`WWW-Authenticate` header naming the enabled mechanisms.
+`WWW-Authenticate` header naming the enabled mechanisms — with mTLS alone
+the list is empty and no header is sent.
 
 **Read-only identities.** `--auth-read-only` (repeatable/comma-separated,
-e.g. `jwt:alice,ldap:bob`) restricts an identity to `GET`/`HEAD`; every
+e.g. `jwt:alice,ldap:cn=bob,ou=users,dc=example,dc=com`) restricts an
+identity to `GET`/`HEAD`; every
 other method is 403. Everything not listed has full access.
 
 ## Blocked parameters
 
-`PATCH /config` (and the Kubernetes `config.json` path) refuses — with a 400,
-before validation — any parameter that tembo relies on or that would let the
+`PATCH /config` refuses — with a 400, before validation — any parameter that
+tembo relies on or that would let the
 configuration execute code as the `postgres` user on every node at a reload's
-distance:
+distance (on the Kubernetes `config.json` path a blocked parameter
+invalidates the whole object instead, and the error is only logged):
 
 - **agent-owned**: `config_file`, `data_directory`, `hba_file`,
   `ident_file`, `port`, `primary_conninfo`, `primary_slot_name`,
@@ -107,17 +111,23 @@ cluster-wide and quietly lose logical slot failover.
   mapped to SIGINT, and (on Linux) `Pdeathsig SIGQUIT` on the postmaster.
 - `--clone-command` runs through `sh -c` as the agent's user — it is an
   operator-provided flag, not reachable through the API.
-- The API writes no files and shells out only in the local-ops handlers (`dump`, `restore`, `backup`, `restore-backup`),
-  with fixed argument
-  vectors; the only client-controlled string reaching a command line is a
+- The API's file writes belong to the local ops: `/restore-backup` untars
+  the request body into the (wiped) data directory, and `/backup` stages
+  `pg_basebackup` in a temporary directory. Shelling out likewise happens in
+  the local-ops handlers — `pg_dumpall`/`pg_dump`/`psql` for
+  `dump`/`restore`, `pg_basebackup`/`tar` for `backup`/`restore-backup`,
+  `pg_ctl` for `reinit`/`restart`/`reload` and the `/health`/`/status`
+  probes — with fixed argument vectors; the only client-controlled string
+  reaching a command line is a
   `?db=` value guarded by `[a-zA-Z0-9_.$-]+`.
 
 ## Passwords
 
 - `TEMBO_PG_PASSWORD`/`--pg-password` never touches the filesystem: the only
   writer is `initdb` of a new cluster, which gets a temporary pwfile (0600, `/tmp`, removed when `initdb` exits).
-- `PUT /password` (`rotate-password`) accepts a password ≤1024 bytes and
-  stores it under the `password` key of the replicated store — readable by
+- `PUT /password` (`rotate-password`) reads at most 1024 bytes of the body —
+  a longer one is silently truncated, an empty one is a 400 — and stores the
+  password under the `password` key of the replicated store — readable by
   every node, returned by no GET. It sits in plain text in each node's
   bbolt file: guard that file as you would a pgpass. Raft log entries carry
   it too, until compaction.
@@ -128,12 +138,15 @@ cluster-wide and quietly lose logical slot failover.
     403. Of the three placements this is the only one where the value never
          enters the raft log or the bbolt files.
 - The rotation reaches the roles as `ALTER ROLE ... PASSWORD` over the
-  agent's local connection — loopback or Unix socket — never over the
-  network in a conninfo; the stored conninfo passwords of `tembo_repl`
-  change with it (replicated through WAL, like the roles).
+  agent's local connection — the Unix socket, 127.0.0.1 or the host's own
+  name, per `--pg-local-auth peer|password|gss` — never over the network in
+  a conninfo. The standbys' `primary_conninfo` passwords do not travel
+  through WAL either: every standby's agent rewrites its own
+  `postgresql.conf` with the new value (reconcile → `Follow`).
 - The LDAP bind password of the API authentication may also come from
   OpenBao (`--bao-ldap-password-path`); in the store mode it does not
-  participate — it is a flag or a file on each node.
+  participate — it is a file on each node (`--auth-ldap-bind-password-file`;
+  there is no value flag).
 
 ## Network exposure summary
 

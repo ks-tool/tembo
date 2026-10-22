@@ -1,6 +1,7 @@
 # HTTP API
 
-Every agent serves its API on the port of its own `--peers` address, on all
+Every agent serves its API on the port of its own `--peers` address (of
+`--advertise` in standalone mode), on all
 interfaces, plain HTTP or HTTPS per the `--tls-*` flags. The same port
 carries raft RPCs, the CLI endpoints and `/metrics`.
 
@@ -18,6 +19,13 @@ is 503. A write whose outcome is unknown (leadership lost mid-flight, or the
 to retry.
 
 ## Cluster state
+
+In standalone mode (no `--peers` and no `--consul`) this whole group except
+`GET /status` is absent — `/switchover`, `/failover` and `/members` answer
+404 — and the writes of `PATCH /config`, `PATCH /settings` and
+`PUT /password` apply locally instead
+of redirecting to a leader. `/status` reports `state: "standalone"`, term 0
+and the node itself as the leader and the only member.
 
 ### `GET /status`
 
@@ -41,15 +49,10 @@ One node's view, as the CLI's `status` prints:
     // standby
     "lsn": 67553424,
     // WAL position in bytes
-    "shutdown_lsn": 0,
-    // set on a cleanly stopped server
     "sync_standbys": [
       "b"
     ],
     // set on a primary
-    "nofailover": false,
-    "nosync": false,
-    "failover_priority": 0,
     "limits": {
       "max_connections": 100,
       "max_locks_per_transaction": 64,
@@ -57,10 +60,8 @@ One node's view, as the CLI's `status` prints:
       "max_wal_senders": 10,
       "max_worker_processes": 32
     },
-    "config": "d41d8c9af012",
+    "config": "d41d8c9af012"
     // hash of the configuration it runs
-    "config_error": "…"
-    // omitted when the last rollout succeeded
   },
   "members": [
     "a",
@@ -70,6 +71,11 @@ One node's view, as the CLI's `status` prints:
   // committed membership, both sets while joint
 }
 ```
+
+`postgres` also carries `shutdown_lsn` (a cleanly stopped server's checkpoint
+position), `nofailover`, `nosync`, `failover_priority` and `config_error` —
+each omitted from the JSON while it holds its zero value; `sync_standbys`
+and `limits` appear only when non-empty.
 
 ### `GET /config`
 
@@ -104,11 +110,12 @@ how you follow a configuration rollout's progress.
 ### `PATCH /config`
 
 Body: a JSON object of parameter → value, or parameter → `null` to reset.
+Values are strings — a JSON number or boolean is a 400.
 
 ```json
 {
   "shared_buffers": "256MB",
-  "max_connections": 200,
+  "max_connections": "200",
   "work_mem": null
 }
 ```
@@ -130,7 +137,7 @@ object (an absent key means the default). `PATCH` takes the same shape as
 answers 403.
 
 ```sh
-curl -X PATCH .../settings -d '{"max-lag-on-failover":"16MB","paused":true}'
+curl -X PATCH .../settings -d '{"max-lag-on-failover":"16MB","paused":"true"}'
 ```
 
 ### `GET /history`
@@ -160,17 +167,19 @@ for the outcome and answers `{"primary": "<id>"}`. With an RFC3339 timestamp
 as the request body the switchover is scheduled instead and the handler
 answers 204 at once.
 
-Refusals (409): a switchover is already pending; the target is the primary
-already, is `nofailover`, is not a running standby, or the primary is
-unreachable. 503: no leader, the new leader is still catching up, no quorum.
-After ~70 s without an outcome: 504 "still in progress" — the leader may
-still finish it or abandon it on its 60-second timeout.
+Refusals: 404 for an unknown node id; 409 when a switchover is already
+pending, the target is the primary already, is `nofailover`, is not a
+running standby, or the primary is unreachable; 503 while there is no
+primary yet ("no primary yet"), no quorum, or the new leader is still
+catching up. After ~70 s without an outcome: 504 "still in progress" — the
+leader may still finish it or abandon it on its 60-second timeout.
 
 ### `POST /failover/{id}`
 
 Promote node `{id}` without waiting for the old primary — the manual,
-primary-is-dead tool; works while `paused`. Guards as for `switchover`, plus
-409 when the primary looks alive ("use switchover"). Answers 204 at once; the
+primary-is-dead tool; works while `paused`. Guards as for `switchover`
+(404 for an unknown node and 503 "no primary yet" included), plus 409 when
+the primary looks alive ("use switchover"). Answers 204 at once; the
 promotion itself happens on the target's next reconcile tick.
 
 ## Membership
@@ -196,15 +205,16 @@ The membership in effect on this node (committed or not):
 
 ### `PUT /members/{id}`
 
-Add node `{id}`, or update its address. The body is the node's `host:port`.
-Answers 204 once the joint entry has committed and applied locally; 409 while
-another membership change is in flight.
+Add node `{id}`, or update its address. The body is the node's `host:port`
+(an empty one is a 400). Answers 204 once the joint entry has committed and
+applied locally; 409 while another membership change is in flight.
 
 ### `DELETE /members/{id}`
 
-Remove node `{id}` from the voting set. The removed node learns this on its
-own and exits; if it is down, the leader keeps trying to deliver the change
-to it for a grace period (~10 election timeouts), then lets it go.
+Remove node `{id}` from the voting set (404 for a node not in it). The
+removed node learns this on its own and exits; if it is down, the leader
+keeps trying to deliver the change to it for a grace period (~10 election
+timeouts), then lets it go.
 
 ## Local node operations
 
@@ -222,7 +232,7 @@ against the node they concern.
 | `POST /restore`        | Feed the request body to `psql` (`ON_ERROR_STOP=1`); respond with its output's tail (≤64 KB). 500 on a psql failure.                                                                                                                                             | If not running (503)                                 |
 | `POST /restore-backup` | Stop fast, wipe the data directory, untar the request body into it, `chmod 0700`; `supervise` starts Postgres.                                                                                                                                                   | On failure (500)                                     |
 
-`?db=` accepts `[a-zA-Z0-9_.$-]+` only.
+`?db=` accepts `[a-zA-Z0-9_.$-]+` only; any other name is a 400.
 
 ## Raft RPCs (nodes only)
 
@@ -232,8 +242,8 @@ against the node they concern.
 | `POST /raft/append`   | `AppendEntries` — replication and heartbeats                    |
 | `POST /raft/snapshot` | `InstallSnapshot` — the state machine for a node compacted past |
 
-JSON bodies and responses as defined in `pkg/raft`. Not useful to humans,
-and outside the allowlist there is nothing to reach them with.
+JSON bodies and responses as defined in `internal/raft`. Not useful to
+humans, and outside the allowlist there is nothing to reach them with.
 
 ## Metrics
 

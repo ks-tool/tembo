@@ -12,7 +12,9 @@ elects the primary through Raft, fails over when the primary dies, keeps
 replication slots and `synchronous_standby_names` in order, rolls out
 configuration changes one node at a time, forwards clients to the primary (read/write) and spreads readers over the
 standbys, and exposes Prometheus
-metrics.
+metrics. A node started without `--peers` and `--consul` runs standalone: a
+cluster of one without Raft, always the primary
+([configuration.md](configuration.md#standalone-mode)).
 
 ## Document index
 

@@ -22,6 +22,16 @@ Build the agent:
 go build -o tembo .
 ```
 
+For a single node — no high availability, no raft — drop `--peers` entirely
+and the agent runs standalone: Postgres is the primary from the start, and
+configuration changes apply locally:
+
+```sh
+tembo run --id solo \
+    --pg-data /var/lib/postgresql/solo \
+    --pg-password-file /etc/tembo/pgpass
+```
+
 Run three agents on three hosts (`a`, `b`, `c` at `10.0.0.1`–`10.0.0.3`).
 Every node lists all nodes in `--peers`, itself included:
 
@@ -70,7 +80,7 @@ tembo --addr 10.0.0.1:8001 status
   "leader": "a",
   "applied": 12,
   "primary": "a",
-  "postgres": {"running": true, "in_recovery": false, "lsn": 67553424, "config": "d41d8c"},
+  "postgres": {"running": true, "in_recovery": false, "lsn": 67553424, "config": "d41d8cd98f00"},
   "members": ["a", "b", "c"]
 }
 ```
@@ -90,7 +100,8 @@ its data directory into a standby's; if rewind keeps failing, after 10
 attempts the directory is discarded and the node reclones itself.
 
 Change a setting on the whole cluster — validated against a real Postgres
-before it commits, rolled out standbys first:
+before it commits, rolled out standbys first (a change that lowers a
+hot-standby limit goes to the primary first instead):
 
 ```sh
 tembo --addr 10.0.0.1:8001 config set shared_buffers=256MB max_connections=200

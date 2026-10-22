@@ -24,10 +24,13 @@ set their own.
 ## `run`
 
 Starts the node: opens the store, joins or forms the raft cluster, serves the
-API, runs both proxies, supervises the local Postgres. See
+API, runs both proxies, supervises the local Postgres. Without `--peers` and
+`--consul` the node runs standalone — no raft, always the primary; the
+cluster commands below (`members`, `switchover`, `failover`) then answer 404.
+See
 [configuration.md](configuration.md) for the full flag reference. Runs until
-`SIGINT`/`SIGTERM` (see [operations.md](operations.md#shutdown) for the
-shutdown sequence). `SIGHUP` is ignored — there is nothing to reload.
+`SIGINT`/`SIGTERM` (see [operations.md](operations.md#shutdown-and-signals)
+for the shutdown sequence). `SIGHUP` is ignored — there is nothing to reload.
 
 ## `status`
 
@@ -46,8 +49,9 @@ tembo config reset shared_buffers
 `set` takes `name=value` pairs; values are validated against a real Postgres
 before committing (a refused parameter names its error). `reset` returns
 parameters to the agent's defaults. Changes roll out node by node — standbys
-in id order, then the primary; see
-[postgres-management.md](postgres-management.md#configuration-rollout).
+in id order, then the primary; a configuration that lowers a hot-standby
+limit goes to the primary first instead (see
+[postgres-management.md](postgres-management.md#configuration-rollout)).
 Disabled in Kubernetes mode.
 
 ## `settings show|set|reset|set-hba` — agent behavior
@@ -60,7 +64,8 @@ tembo settings reset paused
 ```
 
 See [configuration.md](configuration.md#agent-behavior-settings) for the
-settings themselves.
+settings themselves. Like `config`, `set`/`reset`/`set-hba` are disabled in
+Kubernetes mode (`PATCH /settings` answers 403).
 
 ### `set-hba` — add or remove a `pg_hba.conf` line on every node
 
@@ -110,7 +115,7 @@ returns immediately, the switchover runs when its time comes.
 
 Refused with 409 if: a switchover is already pending, the target is the
 primary, is tagged `nofailover`, is not a running standby, or the primary is
-unreachable (use `failover`).
+unreachable (use `failover`). An unknown node id is a 404.
 
 ## `failover node` — promote while the primary is down
 
@@ -121,7 +126,7 @@ tembo failover b
 Promotes a running standby without waiting for the old primary — the tool for
 when the primary is down for good, and the way to fail over manually while
 the cluster is `paused`. Refused with 409 if the primary looks alive ("use
-switchover") or a switchover is pending.
+switchover") or a switchover is pending; an unknown node id is a 404.
 
 ## `rotate-password` — rotate the cluster password
 

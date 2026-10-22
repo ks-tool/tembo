@@ -40,7 +40,8 @@ quorum), standby of the primary, standby of `--follow`, or DR standby of
 second: a standby whose `primary_conninfo` no longer matches (compared as
 parsed conninfo, not text) is repointed with a reload; a primary that the
 store no longer names primary is stopped immediately; the node the store
-names primary but that is still in recovery is promoted.
+names primary but that is still in recovery is promoted — provided the node
+has a quorum.
 
 A former primary rejoining after a failover rewinds: `pg_rewind --source-server`
 against the new primary discards everything written after the timelines
@@ -54,13 +55,17 @@ reset that counter.
 
 `configure` rewrites both files from scratch on every apply:
 
-**`postgresql.conf`** — base settings, tembo's replication defaults, the
-cluster configuration, then the agent's own parameters (`port`, the logging
-collector block, `primary_conninfo`/`primary_slot_name` on a standby,
-`synchronous_standby_names` on a primary), sorted by name, values
-single-quoted with backslash and quote escaped. `pg_hba.conf` follows below.
+### `postgresql.conf`
 
-**`pg_hba.conf`** — generated, in this order:
+Base settings, tembo's replication defaults, the cluster configuration, then
+the agent's own parameters (`port`, the logging collector block,
+`primary_conninfo`/`primary_slot_name` on a standby,
+`synchronous_standby_names` on a primary), sorted by name, values
+single-quoted with backslash and quote escaped.
+
+### `pg_hba.conf`
+
+Generated, in this order:
 
 ```
 local all all peer                                  # the agent, over the socket
@@ -74,17 +79,20 @@ host replication tembo_repl <node-address-1> <method>   # resolved names include
 
 `<method>` is `--pg-host-auth` with its `--pg-host-auth-opts`. Node
 addresses are written as `/32`–`/128` CIDRs; a hostname is written both as a
-name and as the IPs it currently resolves to. The file is rewritten whenever
-the membership or the `hba` setting changes (checked each second after a
-change, and every 30 ticks otherwise) and Postgres reloads it.
+name and as the IPs it currently resolves to. While Postgres is running, the
+file is rewritten whenever the membership or the `hba` setting changes
+(checked each second after a change, and every 30 ticks otherwise) and
+Postgres reloads it.
 
 To grant application access, add `host` lines with `settings set-hba`
-([cli.md](cli.md#set-hba---add-or-remove-a-pg_hbaconf-line-on-every-node));
+([cli.md](cli.md#set-hba--add-or-remove-a-pg_hbaconf-line-on-every-node));
 replication always goes direct between nodes, not through the proxies.
 
 ## Configuration rollout
 
-A `PATCH /config` change commits through raft, then nodes apply it one at a
+A `PATCH /config` change commits through raft (a blocked parameter is
+refused with 400 first — the list is in
+[security.md](security.md#blocked-parameters)), then nodes apply it one at a
 time:
 
 - order: standbys in node-id order, the primary last;
@@ -96,9 +104,10 @@ time:
   primary's WAL up to the position the primary last reported (a record with
   the old, higher value still ahead in replay would pause its recovery);
 - a node waits until every reachable node before it in the order runs the
-  new hash without error; a node that failed reports `config_error`, which
-  the `GET /config` output shows, and does not block the nodes after it
-  forever;
+  new hash without error; a node whose apply failed reports `config_error`
+  (shown by `GET /config`) and **blocks the nodes after it** — it does not
+  retry the same hash. The rollout resumes with a new configuration (a new
+  hash) or once the failed node drops out of the status poll;
 - applying = rewrite the files, check them the way a start would (`postgres -C`), reload, and — if anything shows
   `pending_restart` — stop
   fast and let `supervise` restart (up to 30 s to come back). On failure the
@@ -128,13 +137,23 @@ which needs it. The `tembo_repl` password is the superuser's —
 whatever the cluster last rotated to with
 [`tembo rotate-password`](cli.md#rotate-password--rotate-the-cluster-password):
 the rotation commits through raft, every agent starts using it within a
-second or two, the primary alters both roles (`ALTER ROLE ... PASSWORD`), and
-the standbys receive the change by WAL replay. The startup password counts
+second or two, the primary alters the roles that hold one — `postgres`
+always, `tembo_repl` only where the host authentication is password-based —
+with `ALTER ROLE ... PASSWORD`, and the standbys receive the change by WAL
+replay. The startup password counts
 as applied, so a cluster that never rotated has its roles altered by no one.
+
+With the OpenBao integration (`--bao-password-path`) the store is out of
+this loop: every node polls the secret every fifth reconcile tick (~5 s), a
+new value rotates the roles the same way, and `PUT /password` answers 403 —
+see [configuration.md](configuration.md#openbao).
+`--bao-ldap-password-path` likewise supplies, at startup, the LDAP bind
+password of the API authentication.
 
 With `gss` anywhere, the agent obtains its tickets from
 `--pg-krb5-keytab` (or the credential cache), uses
-`--pg-krb5-principal` (default `postgres`), and exports `KRB5_KTNAME`/
+`--pg-krb5-principal` (default `postgres`) and the `krb5.conf` of
+`--pg-krb5-config`, and exports `KRB5_KTNAME`/
 `KRB5_CONFIG` to the Postgres processes (walreceiver, pg_basebackup,
 pg_rewind) so libpq finds the same credentials. Constraint pairs:
 `password` local auth needs a password-based host auth; `gss` local auth
@@ -155,7 +174,8 @@ Every reconcile tick on the primary ensures:
 
 The agent does not let Postgres write log files. `logging_collector` is
 forced on, `log_destination = csvlog`, and the collector writes into two
-FIFOs the agent created and holds open in `/tmp/tembo-<id>/`:
+FIFOs the agent created and holds open in `$TMPDIR/tembo-<id>/` (`/tmp`
+unless `TMPDIR` points elsewhere):
 
 - `postgres.csv` — the structured csvlog stream, parsed by the agent into
   JSON events with the csvlog columns as fields and the severity mapped to

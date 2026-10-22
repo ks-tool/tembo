@@ -64,8 +64,11 @@ func (s *Server) SetPostgres(p Postgres) {
 }
 
 // HasQuorum reports whether, within fenceTimeout, this node knew a raft leader
-// and reached a majority of the nodes.
+// and reached a majority of the nodes. A standalone node always has it.
 func (s *Server) HasQuorum() bool {
+	if s.node == nil {
+		return true
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return time.Since(s.quorumAt) < fenceTimeout
@@ -73,8 +76,24 @@ func (s *Server) HasQuorum() bool {
 
 // Watch polls the status of every node until ctx is done. It keeps HasQuorum
 // up to date and, on the leader, carries out a requested switchover or
-// replaces a primary whose Postgres is dead.
+// replaces a primary whose Postgres is dead. A standalone node has no peers
+// to poll: it only keeps the nodes view — what route and reconcile read —
+// filled with the local state.
 func (s *Server) Watch(ctx context.Context) {
+	if s.node == nil {
+		t := time.NewTicker(pollInterval)
+		defer t.Stop()
+		for {
+			s.mu.Lock()
+			s.nodes = map[string]Postgres{s.id: s.postgres}
+			s.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}
 	client := &http.Client{Timeout: pollInterval / 2}
 	if s.tlsCfg != nil {
 		client.Transport = &http.Transport{TLSClientConfig: s.tlsCfg}
@@ -83,6 +102,7 @@ func (s *Server) Watch(ctx context.Context) {
 	lsn := make(map[string]uint64)      // its WAL position then
 	syncOf := make(map[string][]string) // and the sync standbys a primary reported
 	var leaderSince, switchoverSince time.Time
+	var wasLeader bool
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
 	for {
@@ -108,7 +128,12 @@ func (s *Server) Watch(ctx context.Context) {
 		}
 		s.mu.Unlock()
 
-		if !s.node.IsLeader() {
+		leader := s.node.IsLeader()
+		if leader && !wasLeader && s.OnLeaderChange != nil {
+			s.OnLeaderChange()
+		}
+		wasLeader = leader
+		if !leader {
 			leaderSince, switchoverSince = time.Time{}, time.Time{}
 			continue
 		}
@@ -263,7 +288,11 @@ func fetchStatus(ctx context.Context, client *http.Client, scheme, addr string) 
 }
 
 // apply replicates cmd through raft; it returns once cmd is applied locally.
+// A standalone server applies cmd to its store directly.
 func (s *Server) apply(ctx context.Context, cmd store.Command) error {
+	if s.node == nil {
+		return s.store.ApplyCommand(cmd)
+	}
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return err
@@ -273,8 +302,9 @@ func (s *Server) apply(ctx context.Context, cmd store.Command) error {
 	return s.node.Propose(ctx, data)
 }
 
-// IsLeader reports whether this node is the raft leader.
-func (s *Server) IsLeader() bool { return s.node.IsLeader() }
+// IsLeader reports whether this node is the raft leader. A standalone node
+// always is.
+func (s *Server) IsLeader() bool { return s.node == nil || s.node.IsLeader() }
 
 // Apply replicates cmd through raft, for the node's own loops rather than an
 // HTTP request; it returns once cmd is applied locally.

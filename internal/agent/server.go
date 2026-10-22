@@ -38,6 +38,9 @@ type Server struct {
 	// OnPeersChange is called when the membership in effect changes. The
 	// addresses of new members become resolvable before the change commits.
 	OnPeersChange func(peers map[string]string)
+	// OnLeaderChange, if set, is called by Watch every time this node becomes
+	// the raft leader. Set it before Watch runs.
+	OnLeaderChange func()
 }
 
 // KeyPrimary holds the id of the node whose Postgres is the primary.
@@ -150,6 +153,14 @@ func NewServer(id string, peers map[string]string, st *store.Store, retentionLog
 	return s, nil
 }
 
+// NewStandalone builds a server that is a cluster of one without raft: no
+// elections, no log — the node is always the leader and the primary, and
+// commands apply to the store directly. addr is this node's API address, the
+// only entry of Peers, which the allowlists and pg_hba.conf are built from.
+func NewStandalone(id, addr string, st *store.Store) *Server {
+	return &Server{id: id, peers: map[string]string{id: addr}, store: st, scheme: "http"}
+}
+
 // UseTLS switches the outbound traffic to the peers — raft RPCs, status
 // polls and the redirect to the leader — to HTTPS; cfg verifies the peers'
 // servers (its RootCAs; nodes carry no client certificates). Call before
@@ -157,7 +168,9 @@ func NewServer(id string, peers map[string]string, st *store.Store, retentionLog
 func (s *Server) UseTLS(cfg *tls.Config) {
 	s.scheme = "https"
 	s.tlsCfg = cfg
-	s.transport.UseTLS(cfg)
+	if s.transport != nil { // nil in standalone: no peers to dial
+		s.transport.UseTLS(cfg)
+	}
 }
 
 // Peers returns the addresses of the current membership, this node included.
@@ -197,8 +210,12 @@ func (s *Server) setPeers(m raft.Membership) {
 
 // Removed reports whether this node has left the cluster for good: its raft
 // node committed a configuration without it, or a quorum of the membership
-// it polls reported one. A removed node's agent stops Postgres and exits.
+// it polls reported one. A removed node's agent stops Postgres and exits. A
+// standalone node is never removed.
 func (s *Server) Removed() bool {
+	if s.node == nil {
+		return false
+	}
 	if s.node.Removed() {
 		return true
 	}
@@ -217,15 +234,28 @@ func (s *Server) Removed() bool {
 }
 
 // Start begins participating in the cluster. Serve Handler() first so peers
-// can reach this node.
-func (s *Server) Start() { s.node.Start() }
+// can reach this node. A standalone server has nothing to start.
+func (s *Server) Start() {
+	if s.node != nil {
+		s.node.Start()
+	}
+}
 
 // Stop leaves the cluster.
-func (s *Server) Stop() { s.node.Stop() }
+func (s *Server) Stop() {
+	if s.node != nil {
+		s.node.Stop()
+	}
+}
 
 // WaitPrimary returns the id of the primary node, waiting until there is one.
-// In a new cluster the raft leader chooses itself.
+// In a new cluster the raft leader chooses itself; a standalone node is the
+// primary by construction.
 func (s *Server) WaitPrimary(ctx context.Context) (string, error) {
+	if s.node == nil {
+		// "add" keeps a primary a previous run of this node recorded.
+		return s.id, s.store.ApplyCommand(store.Command{Op: "add", Key: KeyPrimary, Value: s.id})
+	}
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
@@ -252,8 +282,13 @@ func (s *Server) WaitPrimary(ctx context.Context) (string, error) {
 }
 
 // Handler serves peers (/raft/*) and the CLI (/status, /switchover, /members).
+// A standalone server has no peers and no primary to move: /status alone.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if s.node == nil {
+		mux.HandleFunc("GET /status", s.status)
+		return mux
+	}
 	RegisterRaftHandlers(mux, s.node)
 	mux.HandleFunc("GET /status", s.status)
 	mux.HandleFunc("PUT /switchover/{id}", s.putSwitchover)
@@ -266,8 +301,16 @@ func (s *Server) Handler() http.Handler {
 
 // Propose runs cmd through raft and answers r. A follower answers 307 to the
 // leader, which keeps the method and body, so clients that follow redirects
-// just work.
+// just work. A standalone server applies cmd to its store directly.
 func (s *Server) Propose(w http.ResponseWriter, r *http.Request, cmd store.Command) {
+	if s.node == nil {
+		if err := s.store.ApplyCommand(cmd); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -315,15 +358,22 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	pg := s.postgres
 	s.mu.Unlock()
+	state, term, leader, members := "standalone", uint64(0), s.id, []string{s.id}
+	if s.node != nil {
+		state = s.node.State().String()
+		term = s.node.Term()
+		leader = s.node.Leader()
+		members = memberIDs(s.node.CommittedMembership())
+	}
 	writeJSON(w, Status{
 		ID:       s.id,
-		State:    s.node.State().String(),
-		Term:     s.node.Term(),
-		Leader:   s.node.Leader(),
+		State:    state,
+		Term:     term,
+		Leader:   leader,
 		Applied:  applied,
 		Primary:  primary,
 		Postgres: pg,
-		Members:  memberIDs(s.node.CommittedMembership()),
+		Members:  members,
 	})
 }
 

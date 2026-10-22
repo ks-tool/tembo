@@ -5,17 +5,18 @@ priority (later wins):
 
 1. built-in defaults,
 2. the `--config` file (`.env` or `.json`),
-3. the Kubernetes objects named by `--k8s` (their keys map to the same
-   names as the flags),
+3. the Kubernetes objects named by `--k8s` (their keys are the same
+   `TEMBO_*` names as the environment's, plus the special `config.json`/
+   `settings.json` — see [operations.md](operations.md#kubernetes-mode)),
 4. the environment (`TEMBO_*`),
 5. the command line.
 
 The same names run through all sources: the flag `--pg-port` is the
-environment variable `TEMBO_PG_PORT` and the file key `PG_PORT`. Keys in the
-`--config` file are the environment names without the prefix, upper- or
-lower-case (`pg_port = 5433` in `.env`; a `.json` object may also nest,
-`{"pg": {"port": 5433}}` flattening to `PG_PORT`). Values are loaded by
-`app-config` before startup validation.
+environment variable `TEMBO_PG_PORT`, and that is also the key in the
+`--config` file and the `--k8s` objects — the `TEMBO_` prefix stays, in
+upper- or lower-case (`TEMBO_PG_PORT = 5433` in `.env`; a `.json` object may
+also nest, `{"tembo_pg": {"port": 5433}}` flattening to `TEMBO_PG_PORT`).
+Values are loaded by `app-config` before startup validation.
 
 The environment also carries two logging switches read before anything else:
 `TEMBO_LOG_DEBUG` (any `1/true/yes/on/t*/y*` value enables debug logging) and
@@ -28,16 +29,28 @@ The environment also carries two logging switches read before anything else:
 | Flag           | Env                | Default       | Description                                                                                                                                                                                                                                                                                                 |
 |----------------|--------------------|---------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `--id`         | `TEMBO_ID`         | the hostname  | This node's id. Must appear in `--peers`. Lowercase letters, digits and underscores only — it names a replication slot; when unset it comes from the hostname with dashes turned into underscores (in Kubernetes, the pod's name).                                                                          |
-| `--peers`      | `TEMBO_PEERS`      | —             | All nodes, comma separated, this node included. An item is `id=host:port`, or a bare `host:port`, which names the node after its host — `tembo-a:8001` is node `tembo_a`, the same rule as the `--id` default. Hosts that do not sanitize into an id (an IP, dots, uppercase) need the explicit `id=` form. |
+| `--peers`      | `TEMBO_PEERS`      | —             | All nodes, comma separated, this node included. An item is `id=host:port`, or a bare `host:port`, which names the node after its host — `tembo-a:8001` is node `tembo_a`, the same rule as the `--id` default. Hosts that do not sanitize into an id (an IP, dots, uppercase) need the explicit `id=` form. Without `--peers` and `--consul` the node runs standalone. |
 | `--join`       | `TEMBO_JOIN`       | off           | Join a running cluster: `--peers` names this node and at least one member. Elections stay frozen until the cluster's configuration arrives.                                                                                                                                                                 |
 | `--follow`     | `TEMBO_FOLLOW`     | —             | Replicate from this member instead of the primary (cascading standby).                                                                                                                                                                                                                                      |
 | `--standby-of` | `TEMBO_STANDBY_OF` | —             | Replicate from a foreign host (on `--pg-port`), e.g. a DR copy of another cluster. The node never becomes a primary. Excludes `--follow`.                                                                                                                                                                   |
-| `--advertise`  | `TEMBO_ADVERTISE`  | hostname:8001 | With `--consul`: the address other nodes reach this node at.                                                                                                                                                                                                                                                |
+| `--advertise`  | `TEMBO_ADVERTISE`  | hostname:8001 | With `--consul` or standalone: the address the API is reached at.                                                                                                                                                                                                                                           |
 
-`--id`, `--pg-data`, a password (`--pg-password` or `--pg-password-file`)
-and `--peers` (or `--consul`) are required.
+`--id`, `--pg-data` and a password (`--pg-password`, `--pg-password-file` or
+`--bao-password-path`) are required; a cluster also takes `--peers` (or
+`--consul`).
 
-### Passwords
+### Standalone mode
+
+Without `--peers` and `--consul` the node runs standalone: a cluster of one
+without raft — no elections, no replicated log, no replication slots for
+peers. The node is always the leader and the primary, so Postgres starts at
+once, and `PATCH /config`, `PATCH /settings` and `PUT /password` apply to the
+local store directly instead of going through consensus. `GET /status`
+reports `state: standalone`; the cluster endpoints (`/switchover`,
+`/failover`, `/members`) are absent and answer 404. The API listens on the
+port of `--advertise` (8001 by default). `--join` and `--follow` need
+`--peers`; `--standby-of` combines with standalone for a lone replica of a
+foreign host.
 
 ### Passwords
 
@@ -51,12 +64,13 @@ The password the agent connects with is, in order of precedence:
 4. the first line of `--pg-password-file`.
 
 A rotation commits through raft and takes effect on every node within a
-second or two; the environment or file value is the bootstrap one that a
-fresh cluster's `initdb` seeds the roles with (from a temporary file that
-exists only for the `initdb` run). Changing the environment or file on a
-running cluster does nothing — rotate with the command instead. A node with
-`--standby-of` is never rotated: its password belongs to the foreign
-upstream.
+second or two; the environment or file value is only the bootstrap one: on a
+fresh cluster `initdb --pwfile` sets the superuser's password from a
+temporary file that exists only for the `initdb` run, and the primary then
+creates the `tembo_repl` role with that same password (`ensureRoles`).
+Changing the environment or file on a running cluster does nothing — rotate
+with the command instead. A node with `--standby-of` is never rotated: its
+password belongs to the foreign upstream.
 
 ### OpenBao
 
@@ -76,8 +90,10 @@ server to make it the source of truth for the cluster's password:
 With `--bao-password-path`, every node reads the secret at startup and polls
 it every ~5 seconds afterwards. A changed `password` value has the effect of
 a cluster-wide rotation: the agents switch within seconds, the primary
-alters the `postgres` and `tembo_repl` roles, and the standbys receive them
-by WAL replay — [the rotation flow](#passwords) without the CLI. Consequences:
+alters the `postgres` role (and `tembo_repl` where `--pg-host-auth` is
+password-based — under `ldap`/`gss` that role has no password), and the
+standbys receive them by WAL replay — [the rotation flow](#passwords)
+without the CLI. Consequences:
 
 - `PUT /password` and `rotate-password` answer 403: change the secret, not
   the cluster. The store's `password` key is ignored, so the value lives in
@@ -166,7 +182,7 @@ cluster's own addresses. See [security.md](security.md).
 | `--config`           | `TEMBO_CONFIG`         | A `.env` or `.json` file loaded before the other sources.                                                                                                                                                                                                                |
 | `--k8s` (repeatable) | `TEMBO_K8S`            | Kubernetes URIs: `cm://[ns/]name` or `secret://[ns/]name[/key]`. Their `config.json` and `settings.json` keys become the cluster configuration and the agent settings; PATCH `/config` and `/settings` are disabled. See [operations.md](operations.md#kubernetes-mode). |
 | `--consul`           | `TEMBO_CONSUL`         | Consul HTTP API address; enables discovery instead of `--peers`.                                                                                                                                                                                                         |
-| `--consul-service`   | `TEMBO_CONSUL_SERVICE` | `tembo`                                                                                                                                                                                                                                                                  | Service name for registration and discovery. |
+| `--consul-service`   | `TEMBO_CONSUL_SERVICE` | Service name for registration and discovery (default `tembo`).                                                                                                                                                                                                           |
 | `--consul-tags`      | `TEMBO_CONSUL_TAGS`    | Comma-separated tags: nodes sharing the service and all the tags form one cluster.                                                                                                                                                                                       |
 | `--consul-expect`    | `TEMBO_CONSUL_EXPECT`  | Wait for at least this many discovered nodes before bootstrapping.                                                                                                                                                                                                       |
 

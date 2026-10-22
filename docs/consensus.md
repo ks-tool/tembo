@@ -1,12 +1,13 @@
 # Consensus: the raft package and the store
 
-`pkg/raft` is a small, self-contained implementation of the Raft consensus
-algorithm — leader election, log replication and commit, and membership
+`internal/raft` is a small, self-contained implementation of the Raft
+consensus algorithm — leader election, log replication and commit, and
+membership
 changes through joint consensus. It knows nothing about HTTP or Postgres:
 it talks to the outside world through a `Transport` interface (outbound) and
 three `Handle*` methods (inbound), and persists through a `Storage`
 interface. tembo wires it up as JSON over HTTP with a bbolt-backed storage;
-see `pkg/agent/transport.go` and `pkg/store/raftlog.go`.
+see `internal/agent/transport.go` and `internal/store/raftlog.go`.
 
 What it deliberately leaves out:
 
@@ -95,7 +96,7 @@ keeping the suffix when the follower's log still contains the base entry.
 A node running without a `Storage` (not tembo's case) refuses a snapshot with
 `Success: false`, and the leader does not count phantom delivery.
 
-## The store (`pkg/store`)
+## The store (`internal/store`)
 
 One bbolt file (default `<id>.db`) with four buckets:
 
@@ -153,4 +154,5 @@ Raft RPCs are JSON over HTTP POST: `/raft/vote`, `/raft/append`,
 through the current membership (membership changes take effect immediately),
 uses plain HTTP, or HTTPS with the CA of `--tls-ca-file` when the API serves
 TLS. The inbound handlers are mounted on the same port as the CLI API, behind
-the same allowlist (nodes and loopback only).
+the same allowlist (cluster nodes, the loopback, and the addresses of the
+`hba` setting — see [security.md](security.md#the-address-allowlist)).

@@ -58,7 +58,7 @@ var nodeID = regexp.MustCompile(`^[a-z0-9_]+$`)
 // the environment and the command line, the later winning over the earlier.
 type runConfig struct {
 	ID                       string   `env:"ID" flag:"id" help:"this node's id (must appear in --peers)"`
-	Peers                    string   `env:"PEERS" flag:"peers" help:"all nodes as id=host:port or bare host:port (the host names the node), comma separated"`
+	Peers                    string   `env:"PEERS" flag:"peers" help:"all nodes as id=host:port or bare host:port (the host names the node), comma separated; without --peers and --consul the node runs standalone, a cluster of one without raft"`
 	Join                     bool     `env:"JOIN" flag:"join" help:"join a running cluster: --peers names this node and at least one member"`
 	DB                       string   `env:"DB" flag:"db" help:"BoltDB file (default <id>.db)"`
 	Listen                   string   `env:"LISTEN" flag:"listen" help:"address for clients, forwarded to the primary"`
@@ -88,7 +88,7 @@ type runConfig struct {
 	ConsulService            string   `env:"CONSUL_SERVICE" flag:"consul-service" help:"Consul service name for the registration and the discovery"`
 	ConsulTags               string   `env:"CONSUL_TAGS" flag:"consul-tags" help:"comma-separated tags: nodes sharing the service and all the tags form one cluster"`
 	ConsulExpect             int      `env:"CONSUL_EXPECT" flag:"consul-expect" help:"wait for at least this many discovered nodes before bootstrapping"`
-	Advertise                string   `env:"ADVERTISE" flag:"advertise" help:"host[:port] other nodes reach this node at (with --consul; default: the hostname, port 8001)"`
+	Advertise                string   `env:"ADVERTISE" flag:"advertise" help:"host[:port] the API is reached at (with --consul or standalone; default: the hostname, port 8001)"`
 	BaoAddress               string   `env:"BAO_ADDRESS" flag:"bao-address" help:"OpenBao (Vault) API address, e.g. https://bao:8200; enables the password integration"`
 	BaoToken                 string   `env:"BAO_TOKEN" flag:"bao-token" help:"OpenBao token; --bao-token-file is the file variant"`
 	BaoTokenFile             string   `env:"BAO_TOKEN_FILE" flag:"bao-token-file" help:"file with the OpenBao token"`
@@ -197,12 +197,30 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 	}
-	if rc.ID == "" || rc.Peers == "" || rc.PGData == "" ||
+	// Standalone — no --peers and no --consul — is a cluster of one without
+	// raft: this node is the primary, and the configuration applies to its
+	// store directly.
+	standalone := rc.Peers == "" && rc.Consul == ""
+	if rc.ID == "" || rc.PGData == "" ||
 		(rc.PGPassword == "" && rc.PGPasswordFile == "" && rc.BaoPasswordPath == "") {
-		return errors.New("required: --id, --pg-data, --peers or --consul, and --pg-password, --pg-password-file or --bao-password-path (or the TEMBO_ environment variables)")
+		return errors.New("required: --id, --pg-data, and --pg-password, --pg-password-file or --bao-password-path (or the TEMBO_ environment variables); a cluster also takes --peers or --consul")
 	}
-	peers, err := parsePeers(rc.Peers)
-	if err != nil {
+	if standalone && rc.Join {
+		return errors.New("--join needs --peers naming this node and at least one member of the running cluster")
+	}
+	if standalone && rc.Follow != "" {
+		return errors.New("--follow needs --peers: it names a member of the cluster")
+	}
+	var peers map[string]string
+	if standalone {
+		// The API address stands in for the membership: the allowlists and
+		// pg_hba.conf are built from it.
+		host, port, err := advertiseAddr(rc.Advertise)
+		if err != nil {
+			return err
+		}
+		peers = map[string]string{rc.ID: net.JoinHostPort(host, strconv.Itoa(port))}
+	} else if peers, err = parsePeers(rc.Peers); err != nil {
 		return err
 	}
 
@@ -234,9 +252,14 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 	}
 	defer func() { _ = st.Close() }()
 
-	srv, err := agent.NewServer(rc.ID, peers, st, rc.Retention, rc.Join)
-	if err != nil {
-		return err
+	var srv *agent.Server
+	if standalone {
+		srv = agent.NewStandalone(rc.ID, addr, st)
+	} else {
+		srv, err = agent.NewServer(rc.ID, peers, st, rc.Retention, rc.Join)
+		if err != nil {
+			return err
+		}
 	}
 	if tlsCfg != nil {
 		// The nodes verify each other with the CA of --tls-ca-file, or with
@@ -416,7 +439,7 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 	go func() { serveErr <- httpSrv.Serve(apiLn) }()
 
 	srv.Start()
-	log.Info().Str("id", rc.ID).Stringer("api", apiLn.Addr()).Stringer("clients", proxyLn.Addr()).
+	log.Info().Str("id", rc.ID).Bool("standalone", standalone).Stringer("api", apiLn.Addr()).Stringer("clients", proxyLn.Addr()).
 		Stringer("readers", readerLn.Addr()).Str("db", rc.DB).Msg("node started")
 
 	// The drains read the log FIFOs until the shutdown closes them; any
@@ -428,11 +451,15 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 	ctx, stopPG := context.WithCancel(drainCtx)
 	drains.Go(func() error { return tailFIFO(ctx, plainLog, newLineLog("postgres")) })
 	drains.Go(func() error { return tailCSV(ctx, csvLog) })
+
 	var wg sync.WaitGroup
-	wg.Go(func() { srv.Watch(ctx) })
 	if managed {
-		wg.Go(func() { kubeWatch(ctx, kube, srv, st, pg) })
+		kw := newKubeWatcher(srv, st, pg)
+		// Set before Watch runs: gaining leadership re-applies the objects.
+		srv.OnLeaderChange = func() { kw.apply(ctx) }
+		wg.Go(func() { kw.watch(ctx, kube) })
 	}
+	wg.Go(func() { srv.Watch(ctx) })
 	wg.Go(func() { reconcile(ctx, srv, st, pg, bao) })
 	wg.Go(func() { leaveWhenRemoved(ctx, srv, stopPG) })
 	px, readers := proxy.New(), proxy.New()
@@ -494,8 +521,9 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 	}
 
 	// The first signal stopped the loops, which shut Postgres down cleanly. A
-	// second signal, or shutdownTimeout, gives up on that and kills it; a
-	// third one is left to the default action, which kills the agent.
+	// second signal, or shutdownTimeout, gives up on that and kills it. The
+	// hurry channel buffers one signal and signal.Notify never blocks, so
+	// anything beyond that is dropped — the hurry stop fires once.
 	hurry := make(chan os.Signal, 1)
 	signal.Notify(hurry, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(hurry)
@@ -540,6 +568,7 @@ func parsePeers(s string) (map[string]string, error) {
 	if s == "" {
 		return nil, errors.New("--peers is required, e.g. a=127.0.0.1:8001,b=127.0.0.1:8002,c=127.0.0.1:8003")
 	}
+
 	peers := make(map[string]string)
 	for item := range strings.SplitSeq(s, ",") {
 		item = strings.TrimSpace(item)
@@ -554,9 +583,11 @@ func parsePeers(s string) (map[string]string, error) {
 		} else if id == "" || addr == "" {
 			return nil, fmt.Errorf("bad peer %q, want id=host:port or host:port", item)
 		}
+
 		if !nodeID.MatchString(id) {
 			return nil, fmt.Errorf("bad peer id %q, want [a-z0-9_] only: it names a replication slot; write id=host:port", id)
 		}
+
 		if _, dup := peers[id]; dup {
 			return nil, fmt.Errorf("duplicate peer %q", id)
 		}
@@ -658,11 +689,13 @@ func route(ctx context.Context, srv *agent.Server, st *store.Store, px, readers 
 			return
 		case <-t.C:
 		}
+
 		var primaryTarget, standbyTargets []string
 		primary, err := st.Get(agent.KeyPrimary)
 		switchover := pendingSwitchover(st)
 		nodes := srv.Nodes()
 		peers := srv.Peers()
+
 		if err == nil && switchover == "" && srv.HasQuorum() {
 			if host, err := hostOf(peers, primary); err == nil && nodes[primary].Running && !nodes[primary].InRecovery {
 				primaryTarget = []string{net.JoinHostPort(host, strconv.Itoa(rc.PGPort))}
@@ -677,9 +710,11 @@ func route(ctx context.Context, srv *agent.Server, st *store.Store, px, readers 
 				standbyTargets = primaryTarget // no standby: readers go to the primary
 			}
 		}
+
 		if px.SetTargets(primaryTarget) {
 			log.Info().Strs("targets", primaryTarget).Msg("proxy: clients go to")
 		}
+
 		if readers.SetTargets(standbyTargets) {
 			log.Info().Strs("targets", standbyTargets).Msg("proxy: readers go to")
 		}
