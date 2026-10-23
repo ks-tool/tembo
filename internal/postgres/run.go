@@ -455,8 +455,9 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 	var wg sync.WaitGroup
 	if managed {
 		kw := newKubeWatcher(srv, st, pg)
-		// Set before Watch runs: gaining leadership re-applies the objects.
-		srv.OnLeaderChange = func() { kw.apply(ctx) }
+		// Set before Watch runs: gaining leadership re-applies the objects. It
+		// runs apart from the poll loop, which must not stall on the proposal.
+		srv.OnLeaderChange = func() { go kw.apply(ctx) }
 		wg.Go(func() { kw.watch(ctx, kube) })
 	}
 	wg.Go(func() { srv.Watch(ctx) })
@@ -522,8 +523,9 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 
 	// The first signal stopped the loops, which shut Postgres down cleanly. A
 	// second signal, or shutdownTimeout, gives up on that and kills it. The
-	// hurry channel buffers one signal and signal.Notify never blocks, so
-	// anything beyond that is dropped — the hurry stop fires once.
+	// hurry channel holds one signal; the stop it triggers runs once. Further
+	// signals are not acted on here: the NotifyContext in main keeps capturing
+	// them until this function returns, so they do not kill the agent either.
 	hurry := make(chan os.Signal, 1)
 	signal.Notify(hurry, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(hurry)
@@ -568,7 +570,6 @@ func parsePeers(s string) (map[string]string, error) {
 	if s == "" {
 		return nil, errors.New("--peers is required, e.g. a=127.0.0.1:8001,b=127.0.0.1:8002,c=127.0.0.1:8003")
 	}
-
 	peers := make(map[string]string)
 	for item := range strings.SplitSeq(s, ",") {
 		item = strings.TrimSpace(item)
@@ -583,11 +584,9 @@ func parsePeers(s string) (map[string]string, error) {
 		} else if id == "" || addr == "" {
 			return nil, fmt.Errorf("bad peer %q, want id=host:port or host:port", item)
 		}
-
 		if !nodeID.MatchString(id) {
 			return nil, fmt.Errorf("bad peer id %q, want [a-z0-9_] only: it names a replication slot; write id=host:port", id)
 		}
-
 		if _, dup := peers[id]; dup {
 			return nil, fmt.Errorf("duplicate peer %q", id)
 		}
@@ -689,13 +688,11 @@ func route(ctx context.Context, srv *agent.Server, st *store.Store, px, readers 
 			return
 		case <-t.C:
 		}
-
 		var primaryTarget, standbyTargets []string
 		primary, err := st.Get(agent.KeyPrimary)
 		switchover := pendingSwitchover(st)
 		nodes := srv.Nodes()
 		peers := srv.Peers()
-
 		if err == nil && switchover == "" && srv.HasQuorum() {
 			if host, err := hostOf(peers, primary); err == nil && nodes[primary].Running && !nodes[primary].InRecovery {
 				primaryTarget = []string{net.JoinHostPort(host, strconv.Itoa(rc.PGPort))}
@@ -710,11 +707,9 @@ func route(ctx context.Context, srv *agent.Server, st *store.Store, px, readers 
 				standbyTargets = primaryTarget // no standby: readers go to the primary
 			}
 		}
-
 		if px.SetTargets(primaryTarget) {
 			log.Info().Strs("targets", primaryTarget).Msg("proxy: clients go to")
 		}
-
 		if readers.SetTargets(standbyTargets) {
 			log.Info().Strs("targets", standbyTargets).Msg("proxy: readers go to")
 		}
