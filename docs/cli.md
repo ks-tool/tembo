@@ -18,6 +18,10 @@ automatically (HTTP 307), so any node's address works.
 | `--krb5-keytab`, `--krb5-principal` | —                                     | Log in fresh from a keytab instead (principal as `user@REALM`).                                 |
 | `--krb5-config`                     | `$KRB5_CONFIG` or `/etc/krb5.conf`    | `krb5.conf` to use.                                                                             |
 
+With API authentication configured on the node, the CLI there needs
+credentials like any other client: `--krb5`, `--token`, `--username`, or a
+client certificate. Only `tembo health` runs without them.
+
 Requests without a deadline get one of 10 seconds; long-running ones (`switchover` 90 s, `dump`/`backup`/`restore*` 1 h)
 set their own.
 
@@ -189,6 +193,48 @@ node whose Postgres is down must keep taking part in it.
 Prints the cluster's failover and switchover history — a JSON object of
 RFC3339 timestamp → event, kept under the `history` key and written by
 whichever node was the raft leader at the time.
+
+## `shell` / `psql` — psql on the node, as a Postgres role
+
+```sh
+tembo shell --user app                      # psql in the agent's container, database postgres
+tembo shell --user app --db app             # another database
+echo 'select 1;' | PGPASSWORD=... tembo shell --user app   # input from a pipe, password from the env
+```
+
+The agent runs `psql` on its node, in its container, and the command carries
+the terminal to it: input goes up to psql's stdin over the API, output comes
+back as psql writes it. Nothing needs installing on the machine the command
+runs on.
+
+psql logs in as the role given by `--user` (or `PGUSER`), over TCP to the
+node's Postgres. `pg_hba.conf` decides the method, so Postgres's own
+authentication applies to every session: a wrong password is refused by
+Postgres. The password is `PGPASSWORD`, or it is asked for on the terminal
+with echo off. It travels in an API header, so it is refused over plain HTTP
+to any host but the loopback: use `https://` or `--tls-*`, or run the command
+on the node.
+
+With Kerberos (`--krb5`, or `--krb5-keytab` with `--krb5-principal`) the session logs in as yourself, with no role or password asked for. The node impersonates you to the Postgres service with S4U2Self and S4U2Proxy, so no ticket-granting ticket of yours leaves the KDC: only a service ticket for `postgres/<host>` is written to a credential cache in a temporary directory, which is removed when the session ends. Postgres's own `gss` rules decide the role: a role of your name, with `include_realm=0` in `pg_hba.conf`.
+
+Needed for it:
+
+- On the node: `--shell-krb5-spn postgres/<host>` and `--shell-krb5-principal HTTP/<host>@REALM`, with the keytab of that principal in `--auth-krb5-keytab`. The API's Kerberos principal is the same one.
+- In the KDC, for that principal: `okToAuthAsDelegate`, `allowedToDelegateTo` containing the Postgres service, and `allowedToImpersonate` listing the users who may open a shell. An empty list means **any** principal may be impersonated.
+- In Postgres: a `gss` line for the node's host in `pg_hba.conf` (`--pg-host-auth gss --pg-host-auth-opts include_realm=0`), a keytab for the Postgres service (`--pg-krb5-keytab`, and `krb_server_keyfile` pointing at it), and the role of each user.
+
+The session needs the API authentication and full access (a read-only identity
+is refused: a session is a `POST`). The audit log has one line for the API call
+with the identity that opened it, and the agent logs the session's Postgres role
+and database at its start and end.
+
+Limits, as they are now:
+
+- No terminal is allocated on the node: no line editing, no history, no `\e`.
+  Input is line by line.
+- The exit status of psql is not returned: the command exits 0 when the session
+  ends, and psql's errors are in the output (a refused login included).
+- SQL typed in the session is not in the audit log.
 
 ## `dump` / `restore` — logical backups
 

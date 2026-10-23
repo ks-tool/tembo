@@ -14,7 +14,8 @@ TLS (optional) → address allowlist → authentication (optional) → handler
 Every request's source address is matched against the same list
 `pg_hba.conf` is written from:
 
-- the loopback (so the CLI always works locally),
+- the loopback (the CLI reaches the API on its node; with authentication on it still
+  has to authenticate, see below),
 - the hosts of the current raft membership (raft RPCs, status polls,
   proxy connections to Postgres),
 - the address fields of the `host` lines of the `hba` setting (`all` widens to `0.0.0.0/0` and `::/0`; `samehost`/
@@ -48,9 +49,11 @@ present a client certificate. An `--addr` without a scheme is assumed
 ## API authentication
 
 Enabled by any of the `--auth-*` flags — or by `--tls-ca-file` alone, which
-turns mTLS on. Cluster nodes and the loopback are
-exempt — the allowlist already restricts them; every other address must
-authenticate. Supported mechanisms, checked by the credential the request
+turns mTLS on. Cluster nodes are exempt on the raft and status paths only
+(`/raft/*`, `GET /status`); every other request, the
+loopback included, must authenticate. `GET /health` is the one exception: it
+answers only whether the local Postgres answers SQL, and supervisors run
+`tembo health` without credentials. Supported mechanisms, checked by the credential the request
 carries:
 
 | Mechanism | Request carries                     | Identity             | Enabled by                                                                                                                                                                                                        |
@@ -147,6 +150,34 @@ cluster-wide and quietly lose logical slot failover.
   OpenBao (`--bao-ldap-password-path`); in the store mode it does not
   participate — it is a file on each node (`--auth-ldap-bind-password-file`;
   there is no value flag).
+
+## Audit of API calls
+
+Every API request that changes state (anything but `GET` and `HEAD`), and
+every refused one (401, 403), is logged as one JSON line:
+
+```json
+{"level":"info","audit":true,"actor":"jwt:alice","method":"PUT","path":"/switchover/node2","status":200,"message":"api call"}
+```
+
+- `actor` is the identity the authentication gave: `jwt:<subject>`,
+  `krb5:<user@domain>`, `ldap:<DN of the user>` or `cert:<certificate CN>`.
+- A request with no identity is named by its address: `addr:<host>`. That is
+  a node, or any request while authentication is off. With authentication on,
+  the CLI on a node is named by its credentials like any other client.
+- The body is not logged: it can hold passwords (`PUT /password`,
+  `PATCH /config` with secrets). Query strings are not logged either.
+- The raft messages between the nodes (`/raft/*`) are not logged: they are
+  sent every heartbeat.
+- `history` keeps the cluster's failover and switchover events; the audit
+  line is the record of who asked for them and everything else.
+- A `shell` session is one `POST /shell`: its API line names who opened it.
+  The agent logs the session's Postgres role and database when it opens and
+  when it ends. The SQL typed in it is not logged by tembo; only Postgres's own
+  logging (`log_statement`) records it, and tembo does not manage that setting.
+- The session's Postgres password travels in the `X-Tembo-Pg-Password` header,
+  so the client refuses to send it over plain HTTP to any host but the loopback.
+  The header is not logged.
 
 ## Network exposure summary
 

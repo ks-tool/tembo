@@ -84,4 +84,4 @@ Postgres. A node whose Postgres is down still serves `/metrics` (the `pg_*`
 part yields nothing but a fresh connection failure; the `tembo_*` part keeps
 working). `/metrics` goes through the same authentication as the rest of the
 API: when it is configured, a scraper outside the cluster's own addresses
-needs credentials — only the loopback and the nodes are exempt ([security.md](security.md#api-authentication)).
+needs credentials — only the nodes are exempt ([security.md](security.md#api-authentication)).

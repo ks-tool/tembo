@@ -11,9 +11,11 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ks-tool/tembo/internal/agent"
+	"github.com/ks-tool/tembo/internal/auth"
 	"github.com/ks-tool/tembo/internal/exec"
 	"github.com/ks-tool/tembo/internal/store"
 
@@ -193,6 +195,79 @@ func opsHandlers(mux *http.ServeMux, st *store.Store, pg *Instance, id string) {
 		_, _ = w.Write(out.Bytes())
 	})
 
+	// shell runs psql on the node and makes the request a dialogue: the body is
+	// its stdin, and its output goes back as it is written. The session logs in
+	// over TCP, so pg_hba.conf decides the method, as for any client. A Kerberos
+	// caller (with --shell-krb5-spn) is impersonated to Postgres; any other logs
+	// in as the role of X-Tembo-Pg-User, with X-Tembo-Pg-Password. The session is
+	// a POST, so read-only access does not reach it.
+	mux.HandleFunc("POST /shell", func(w http.ResponseWriter, r *http.Request) {
+		db := r.URL.Query().Get("db")
+		if db == "" {
+			db = "postgres"
+		}
+		if !dbNameRe.MatchString(db) {
+			http.Error(w, "bad database name", http.StatusBadRequest)
+			return
+		}
+		id, krb5 := auth.IdentityFrom(r.Context())
+		krb5 = krb5 && id.Mechanism == "krb5" && pg.shell != nil
+
+		var user string
+		if krb5 {
+			user, _, _ = strings.Cut(id.Name, "@")
+		} else {
+			user = r.Header.Get("X-Tembo-Pg-User")
+		}
+		if !dbNameRe.MatchString(user) {
+			http.Error(w, "a Postgres role is required in X-Tembo-Pg-User", http.StatusBadRequest)
+			return
+		}
+		if state, _, _ := pg.Status(r.Context()); !state.Running {
+			http.Error(w, "postgres is not running", http.StatusServiceUnavailable)
+			return
+		}
+		rc := http.NewResponseController(w)
+		if err := rc.EnableFullDuplex(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		out := flushWriter{w: w, rc: rc}
+		host := "127.0.0.1"
+		var env [][2]string
+		if krb5 {
+			// The ticket is for the Postgres service's host name, so psql connects by it.
+			ccname, cleanup, err := pg.shell.ccache(id.Name)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
+			defer cleanup()
+			host = pg.shell.host
+			// Plain gss, as pg_hba's gss rules are written: no GSS encryption.
+			env = [][2]string{{"KRB5CCNAME", ccname}, {"PGGSSENCMODE", "disable"}}
+		} else {
+			// The password goes in the environment, where psql reads it, and not on
+			// the command line.
+			env = [][2]string{{"PGPASSWORD", r.Header.Get("X-Tembo-Pg-Password")}}
+		}
+		c := exec.New(exec.SetOutput(out), exec.SetErrOut(out))
+		for _, kv := range env {
+			c.SetEnv(kv[0], kv[1])
+		}
+		log.Info().Str("pg_user", user).Str("db", db).Bool("kerberos", krb5).Msg("shell: session opened")
+		// -w: psql never prompts, there is no terminal here.
+		cmd := c.Command(r.Context(), pg.bin("psql"), "-X", "-w",
+			"-h", host, "-p", strconv.Itoa(pg.Port), "-U", user, "-d", db)
+		cmd.Stdin = r.Body
+		if err := cmd.Run(); err != nil {
+			log.Info().Err(err).Str("pg_user", user).Str("db", db).Msg("shell: session closed with an error")
+		} else {
+			log.Info().Str("pg_user", user).Str("db", db).Msg("shell: session closed")
+		}
+	})
+
 	// restore-backup replaces the data directory with the tar of /backup;
 	// supervise starts postgres with it afterwards. A standby ahead of the
 	// backup heals itself: pg_rewind, or a reclone after its failures.
@@ -353,4 +428,17 @@ var restoreBackupCmd = &cobra.Command{
 func init() {
 	dumpCmd.Flags().String("db", "", "dump only this database, default is the whole cluster")
 	rootCmd.AddCommand(reinitCmd, restartCmd, reloadCmd, healthCmd, historyCmd, dumpCmd, backupCmd, restoreCmd, restoreBackupCmd)
+}
+
+// flushWriter sends each write to the client at once: a shell session is a
+// dialogue, and a prompt has no newline to end the buffer with.
+type flushWriter struct {
+	w  io.Writer
+	rc *http.ResponseController
+}
+
+func (f flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	_ = f.rc.Flush()
+	return n, err
 }

@@ -125,6 +125,8 @@ type Instance struct {
 	// PGPASSWORD, e.g. a restore by wal-g or pgBackRest.
 	InitdbArgs []string
 	CloneCmd   string
+	// shell, when set, lets the shell log in as Kerberos users, see shell_krb5.go.
+	shell *shellKerberos
 
 	// LocalAuth is how the agent itself connects to Postgres: "peer" (the
 	// Unix socket), "password" (TCP to 127.0.0.1) or "gss" (TCP + Kerberos).
@@ -581,6 +583,19 @@ func (i *Instance) reload(ctx context.Context) error {
 }
 
 func (i *Instance) createData(ctx context.Context, upstreamHost string, cloneSlot bool) error {
+	// A clone that did not finish leaves its marker, see cloneMarker. What the
+	// directory holds is part of a copy, not data, so it goes before anything
+	// else looks at it: PG_VERSION may already be there.
+	if _, err := os.Stat(i.cloneMarker()); err == nil {
+		log.Warn().Msg("discarding the data of an unfinished clone")
+		if err = i.wipeData(); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("discarding an unfinished clone: %w", err)
+		}
+		if err = os.Remove(i.cloneMarker()); err != nil {
+			return err
+		}
+	}
+
 	_, err := os.Stat(filepath.Join(i.DataDir, "PG_VERSION"))
 	if !errors.Is(err, fs.ErrNotExist) {
 		return err // nil: the data directory already exists
@@ -603,16 +618,28 @@ func (i *Instance) createData(ctx context.Context, upstreamHost string, cloneSlo
 		return nil
 	}
 
+	password, err := i.password()
+	if err != nil {
+		return err
+	}
+	if cloneSlot {
+		// The slot comes before the copy whichever command makes it: from here
+		// on the primary keeps the WAL the copy and the streaming need. The
+		// primary keeps one slot per node, and ensureSlot covers a node it has
+		// not seen yet. A cascaded or foreign upstream has no slot of ours.
+		if err = i.ensureSlot(ctx, upstreamHost); err != nil {
+			return fmt.Errorf("replication slot on %s: %w", upstreamHost, err)
+		}
+	}
+	if err = i.markClone(); err != nil {
+		return err
+	}
+	// Like pg_basebackup, a restore may keep the mode of an existing directory,
+	// and postgres refuses to start unless it is 0700 or 0750.
+	if err = os.Chmod(i.DataDir, 0o700); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	if i.CloneCmd != "" {
-		password, err := i.password()
-		if err != nil {
-			return err
-		}
-		// Like pg_basebackup, a restore may keep the mode of an existing
-		// directory, and postgres refuses to start unless it is 0700 or 0750.
-		if err = os.Chmod(i.DataDir, 0o700); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
 		// A shell command, not a Postgres binary: no BinDir lookup.
 		cmd := exec.New(exec.SetContext(ctx), exec.SetSignal(syscall.SIGINT),
 			exec.SetCommand("sh", "-c", i.CloneCmd), exec.SetOutput(newLineLog("clone")),
@@ -621,44 +648,49 @@ func (i *Instance) createData(ctx context.Context, upstreamHost string, cloneSlo
 		cmd.SetEnv("TEMBO_PRIMARY_HOST", upstreamHost)
 		cmd.SetEnv("TEMBO_PRIMARY_PORT", strconv.Itoa(i.Port))
 		cmd.SetEnv("PGPASSWORD", password)
-		if err := cmd.Run(); err != nil {
+		if err = cmd.Run(); err != nil {
 			return fmt.Errorf("clone command: %w", err)
 		}
-		return os.WriteFile(filepath.Join(i.DataDir, "standby.signal"), nil, 0o600)
-	}
-
-	password, err := i.password()
-	if err != nil {
-		return err
-	}
-	// Unlike initdb, pg_basebackup keeps the mode of an existing directory,
-	// and postgres refuses to start unless it is 0700 or 0750.
-	if err = os.Chmod(i.DataDir, 0o700); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	args := []string{"--pgdata", i.DataDir,
-		"--host", upstreamHost, "--port", strconv.Itoa(i.Port), "--username", replUser, "--no-password",
-		"--wal-method", "stream", "--checkpoint", "fast"}
-	if cloneSlot {
-		// WAL streams into this node's slot from the start: the primary keeps
-		// one per node, and ensureSlot covers a node it has not seen yet. A
-		// cascaded or foreign upstream has no slot of ours.
-		if err = i.ensureSlot(ctx, upstreamHost); err != nil {
-			return fmt.Errorf("replication slot on %s: %w", upstreamHost, err)
-		}
-		args = append(args, "--slot", i.slotName())
-	}
-	cmd := i.command(ctx, "pg_basebackup", args...)
-	if i.HostAuth == "gss" {
-		// libpq authenticates with Kerberos instead of a password.
-		i.krb5Env(cmd)
 	} else {
-		cmd.SetEnv("PGPASSWORD", password)
+		args := []string{"--pgdata", i.DataDir,
+			"--host", upstreamHost, "--port", strconv.Itoa(i.Port), "--username", replUser, "--no-password",
+			"--wal-method", "stream", "--checkpoint", "fast"}
+		if cloneSlot {
+			// WAL streams into this node's slot from the start.
+			args = append(args, "--slot", i.slotName())
+		}
+		cmd := i.command(ctx, "pg_basebackup", args...)
+		if i.HostAuth == "gss" {
+			// libpq authenticates with Kerberos instead of a password.
+			i.krb5Env(cmd)
+		} else {
+			cmd.SetEnv("PGPASSWORD", password)
+		}
+		if err = cmd.Run(); err != nil {
+			return fmt.Errorf("pg_basebackup from %s: %w", upstreamHost, err)
+		}
 	}
-	if err = cmd.Run(); err != nil {
-		return fmt.Errorf("pg_basebackup from %s: %w", upstreamHost, err)
+	if err = os.WriteFile(filepath.Join(i.DataDir, "standby.signal"), nil, 0o600); err != nil {
+		return err
 	}
-	return os.WriteFile(filepath.Join(i.DataDir, "standby.signal"), nil, 0o600)
+	// The marker goes last: a crash before this leaves it, and the next start
+	// discards the copy instead of starting from it.
+	return os.Remove(i.cloneMarker())
+}
+
+// cloneMarker is the file that says a clone is under way, or was interrupted.
+// It lies beside the data directory, not in it: pg_basebackup writes only into
+// an empty directory, and the marker must exist before the copy starts.
+func (i *Instance) cloneMarker() string {
+	return filepath.Clean(i.DataDir) + ".clone-inprogress"
+}
+
+// markClone creates the data directory if needed and the clone marker.
+func (i *Instance) markClone() error {
+	if err := os.MkdirAll(i.DataDir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(i.cloneMarker(), nil, 0o600)
 }
 
 // rewind makes the data directory of a former primary a standby of

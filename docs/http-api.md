@@ -8,7 +8,8 @@ carries raft RPCs, the CLI endpoints and `/metrics`.
 Requests from addresses outside the allowlist (loopback, cluster nodes, the
 `hba` setting's addresses) are refused with 403 before anything else. When
 authentication is configured, requests from outside the cluster's own
-addresses must carry credentials; cluster nodes and the loopback are exempt.
+addresses must carry credentials, the loopback included; only cluster nodes are
+exempt, and `GET /health` answers without credentials.
 See [security.md](security.md).
 
 Writes that go through raft answer from the leader: a follower replies with
@@ -230,6 +231,7 @@ against the node they concern.
 | `GET /dump[?db=name]`  | Stream `pg_dumpall` (or `pg_dump` of one database) as `application/sql`.                                                                                                                                                                                         | If Postgres is not running (503)                     |
 | `GET /backup`          | Stream a tar of a fresh `pg_basebackup -X stream` of the local server as `application/x-tar`.                                                                                                                                                                    | If not running (503)                                 |
 | `POST /restore`        | Feed the request body to `psql` (`ON_ERROR_STOP=1`); respond with its output's tail (≤64 KB). 500 on a psql failure.                                                                                                                                             | If not running (503)                                 |
+| `POST /shell`          | Run `psql` on the node (`?db=`, default `postgres`) as the role in `X-Tembo-Pg-User`, password in `X-Tembo-Pg-Password`, over TCP so `pg_hba.conf` applies; the request body is its stdin, its output streams back as written. With a Kerberos caller and `--shell-krb5-spn`, the agent impersonates the caller to Postgres instead (no role or password header); a refused impersonation answers 403 with the KDC's reason. Full access only. | Without a role (400), a bad name (400), not running (503) |
 | `POST /restore-backup` | Stop fast, wipe the data directory, untar the request body into it, `chmod 0700`; `supervise` starts Postgres.                                                                                                                                                   | On failure (500)                                     |
 
 `?db=` accepts `[a-zA-Z0-9_.$-]+` only; any other name is a 400.

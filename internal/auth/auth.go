@@ -1,15 +1,26 @@
 // Package auth authenticates the clients of the agent's API: JWT (Bearer),
 // Kerberos (SPNEGO Negotiate), LDAP (Basic) and mTLS, and splits them into
-// read-only and full access. Cluster nodes and the loopback are exempt — the
-// address allowlist already covers them; see run.go.
+// read-only and full access. Cluster nodes are exempt; the caller decides
+// which addresses those are, see run.go.
 package auth
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/ks-tool/tembo/internal/audit"
 )
+
+type identityKey struct{}
+
+// IdentityFrom returns the identity Wrap authenticated the request as.
+func IdentityFrom(ctx context.Context) (Identity, bool) {
+	id, ok := ctx.Value(identityKey{}).(Identity)
+	return id, ok
+}
 
 // Identity is an authenticated client: the mechanism and the name it gave.
 type Identity struct {
@@ -85,7 +96,7 @@ func New(cfg Config) (*Auth, error) {
 }
 
 // Wrap protects next with authentication. exempt reports whether a remote
-// address is a cluster node or the loopback — those pass unauthenticated.
+// address is a cluster node — those pass unauthenticated.
 func (a *Auth) Wrap(next http.Handler, exempt func(net.IP) bool) http.Handler {
 	if a == nil {
 		return next
@@ -103,6 +114,8 @@ func (a *Auth) Wrap(next http.Handler, exempt func(net.IP) bool) http.Handler {
 		if !ok {
 			return
 		}
+		r = r.WithContext(context.WithValue(r.Context(), identityKey{}, id))
+		audit.SetActor(r, id.String())
 		if a.ro[id.String()] && r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, id.String()+" is read-only", http.StatusForbidden)
 			return

@@ -84,9 +84,28 @@ func request(ctx context.Context, method, path string, body io.Reader) ([]byte, 
 		defer cancel()
 	}
 
+	res, err := send(ctx, method, path, body, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	data, err := io.ReadAll(res.Body)
+	if res.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("%s: %s", res.Status, strings.TrimSpace(string(data)))
+	}
+	return data, err
+}
+
+// send sends a request to the tembo at agentAddr with the credentials the
+// flags name, and the headers hdr. The caller reads and closes the response body, which may stream.
+func send(ctx context.Context, method, path string, body io.Reader, hdr http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, agentURL()+path, body)
 	if err != nil {
 		return nil, err
+	}
+	for k, v := range hdr {
+		req.Header[k] = v
 	}
 	if !cliKrb5 && cliKrb5Keytab == "" {
 		token, err := bearerToken()
@@ -105,18 +124,7 @@ func request(ctx context.Context, method, path string, body io.Reader) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-
-	res, err := c.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = res.Body.Close() }()
-
-	data, err := io.ReadAll(res.Body)
-	if res.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("%s: %s", res.Status, strings.TrimSpace(string(data)))
-	}
-	return data, err
+	return c.Do(req)
 }
 
 // agentURL returns agentAddr with a scheme: the one it carries, https when

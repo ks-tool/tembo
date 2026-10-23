@@ -24,6 +24,7 @@ import (
 	appconfig "github.com/ks-tool/app-config/go"
 	"github.com/ks-tool/tembo/internal/addrlist"
 	"github.com/ks-tool/tembo/internal/agent"
+	"github.com/ks-tool/tembo/internal/audit"
 	"github.com/ks-tool/tembo/internal/auth"
 	"github.com/ks-tool/tembo/internal/metrics"
 	"github.com/ks-tool/tembo/internal/proxy"
@@ -106,6 +107,8 @@ type runConfig struct {
 	AuthJWTIssuer            string   `env:"AUTH_JWT_ISSUER" flag:"auth-jwt-issuer" help:"issuer a JWT must name"`
 	AuthJWTAudience          string   `env:"AUTH_JWT_AUDIENCE" flag:"auth-jwt-audience" help:"audience a JWT must name"`
 	AuthKrb5Keytab           string   `env:"AUTH_KRB5_KEYTAB" flag:"auth-krb5-keytab" help:"keytab of the API's Kerberos principal, enables SPNEGO"`
+	ShellKrb5SPN             string   `env:"SHELL_KRB5_SPN" flag:"shell-krb5-spn" help:"Postgres service the shell impersonates Kerberos users to, e.g. postgres/db.example.com; needs --auth-krb5-keytab and --shell-krb5-principal"`
+	ShellKrb5Principal       string   `env:"SHELL_KRB5_PRINCIPAL" flag:"shell-krb5-principal" help:"the agent's own principal user@REALM for S4U, whose key is in --auth-krb5-keytab"`
 	AuthLDAPURL              string   `env:"AUTH_LDAP_URL" flag:"auth-ldap-url" help:"LDAP server (ldap:// or ldaps://) to authenticate Basic auth against"`
 	AuthLDAPDNTemplate       string   `env:"AUTH_LDAP_DN_TEMPLATE" flag:"auth-ldap-dn-template" help:"direct bind: DN template with %s for the username"`
 	AuthLDAPBindDN           string   `env:"AUTH_LDAP_BIND_DN" flag:"auth-ldap-bind-dn" help:"search-bind: DN to bind with"`
@@ -384,10 +387,9 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 	var allowed atomic.Pointer[addrlist.List]
 	allowed.Store(allowlist(peers, nil))
 
-	// Authentication covers the clients from outside the cluster; the nodes
-	// and the loopback are exempt — the allowlist already restricts them.
-	// peerAddrs is the hosts of the current membership, rebuilt together with
-	// the allowlist.
+	// Authentication covers every client; the membership is exempt on the paths
+	// the nodes use among themselves only, see nodeTraffic. peerAddrs is the
+	// hosts of the current membership, rebuilt together with the allowlist.
 	var peerAddrs atomic.Pointer[addrlist.List]
 	peerAddrs.Store(peerlist(peers))
 	authn, err := auth.New(auth.Config{
@@ -410,6 +412,16 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	if rc.ShellKrb5SPN != "" {
+		if rc.AuthKrb5Keytab == "" {
+			return errors.New("--shell-krb5-spn needs --auth-krb5-keytab")
+		}
+		k, err := newShellKerberos(rc.AuthKrb5Keytab, rc.ShellKrb5Principal, rc.ShellKrb5SPN)
+		if err != nil {
+			return fmt.Errorf("shell: %w", err)
+		}
+		pg.shell = k
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/", srv.Handler())
 	mux.Handle("GET /metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}))
@@ -424,17 +436,11 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 
 	httpSrv := &http.Server{Handler: allowAPI(mux, &allowed)}
 	if authn != nil {
-		exempt := func(ip net.IP) bool {
-			if ip.IsLoopback() {
-				return true
-			}
-			if l := peerAddrs.Load(); l != nil {
-				return l.Allows(ip)
-			}
-			return false
-		}
-		httpSrv.Handler = allowAPI(authn.Wrap(mux, exempt), &allowed)
+		httpSrv.Handler = allowAPI(probes(nodeTraffic(authn.Wrap(mux, nil), mux, &peerAddrs), mux), &allowed)
 	}
+	// Outside everything else, so that the refusals of the allowlist and of
+	// the authentication are logged too, with the actor they name.
+	httpSrv.Handler = audit.Middleware(httpSrv.Handler)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpSrv.Serve(apiLn) }()
 
@@ -915,6 +921,43 @@ func loadCertPool(path string) (*x509.CertPool, error) {
 
 // allowAPI restricts the API to the address list pg_hba.conf is written
 // from: the loopback (the CLI), the nodes (raft) and the hba setting.
+// nodeTraffic lets the membership reach the two paths the nodes talk over
+// without credentials: the raft RPCs and the status polls. Anything else from a
+// member address authenticates like any client. The CLI on a node reaches the
+// API by the node's own address, which is a member address, so exempting the
+// whole API by address would let it skip authentication.
+func nodeTraffic(authed, mux http.Handler, peers *atomic.Pointer[addrlist.List]) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		member := false
+		if l := peers.Load(); l != nil {
+			member = l.Allows(net.ParseIP(host))
+		}
+		internal := strings.HasPrefix(r.URL.Path, "/raft/") || (r.Method == http.MethodGet && r.URL.Path == "/status")
+		if member && internal {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		authed.ServeHTTP(w, r)
+	})
+}
+
+// probes lets GET /health through without credentials. It tells only whether
+// the node's Postgres answers SQL, and supervisors run `tembo health` with no
+// credentials at all. Everything else goes through authed.
+func probes(authed, mux http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/health" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		authed.ServeHTTP(w, r)
+	})
+}
+
 func allowAPI(next http.Handler, cur *atomic.Pointer[addrlist.List]) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)

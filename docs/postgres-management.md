@@ -14,14 +14,21 @@ rewrite.
   password file; extra arguments come from `--initdb-args`
   (e.g. `--data-checksums`).
 - **A standby's empty directory** is cloned from the upstream:
+    - when the upstream is the cluster's primary, the node's slot
+      `tembo_<id>` is created on it first, so the WAL is kept from that
+      moment on whichever command makes the copy;
     - with `--clone-command`, a shell command of yours, run with
       `TEMBO_PGDATA`, `TEMBO_PRIMARY_HOST`, `TEMBO_PRIMARY_PORT` and
       `PGPASSWORD` in the environment — the wal-g/pgBackRest restore entry
       point. After it succeeds the agent writes `standby.signal` itself;
     - otherwise with `pg_basebackup --wal-method=stream --checkpoint=fast`,
-      connecting as `tembo_repl`, and — when the upstream is the cluster's
-      primary — `--slot tembo_<id>`, so the WAL streams into the node's slot
-      from the first byte and there is no gap at the cutover.
+      connecting as `tembo_repl`, `--slot tembo_<id>` on the primary, so the
+      WAL streams into the slot from the first byte and there is no gap at
+      the cutover.
+    - A clone leaves `<PGDATA>.clone-inprogress` beside the directory while
+      it runs. A failed or interrupted clone keeps the marker, and the next
+      start discards the directory and clones again; the marker goes only
+      after `standby.signal` is written.
 - **A former primary's directory** (no `standby.signal`, e.g. after it was
   fenced and the cluster moved on) is rewound, see below.
 - **A postmaster that outlived a killed agent** is detected via
