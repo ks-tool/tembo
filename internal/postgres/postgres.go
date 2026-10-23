@@ -10,12 +10,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var version = "dev"
+
 var rootCmd = &cobra.Command{
 	Use:               "tembo",
 	Short:             "Manager and proxy of one Postgres of a highly available cluster",
 	SilenceErrors:     true,
 	SilenceUsage:      true,
 	CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
+	Version:           version,
 }
 
 func Run() {

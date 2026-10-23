@@ -4,8 +4,10 @@ WORKDIR /app
 
 COPY . .
 
+ARG VERSION=dev
+
 RUN --mount=type=cache,target=/go/pkg/mod apk add --no-cache make && \
-    make build
+    make build VERSION=${VERSION}
 
 
 FROM postgres:18-alpine
