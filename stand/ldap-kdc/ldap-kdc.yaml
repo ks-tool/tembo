@@ -1,0 +1,48 @@
+# The ldap-kdc half of the compose stand. Mirrors the end-to-end fixture: the addresses are
+# fixed because the DNS zone has to name them before the containers that own them exist.
+server:
+  realm: EXAMPLE.COM
+  anonymous_dse: true
+
+database:
+  path: /var/lib/ldap-kdc/ldap-kdc.db
+  master_key_file: /var/lib/ldap-kdc/master.key
+
+ldap:
+  listen: 0.0.0.0:389
+
+ldaps:
+  # No certificate paths: the listener starts anyway and the certificate arrives through the
+  # Vault enrollment, which compose/setup.sh configures.
+  enabled: true
+
+kdc:
+  listen: 0.0.0.0:88
+
+kpasswd:
+  listen: 0.0.0.0:464
+  min_password_length: 8
+
+dns:
+  enabled: true
+  listen: 0.0.0.0:53
+  hostname: kdc.example.com
+  addresses:
+    - 10.99.0.10
+  reverse_zones:
+    - 0.99.10.in-addr.arpa
+  # Every container on the example.com network gets an A record in the zone: web -> web.example.com,
+  # removed when it stops. Reverse queries are answered from these records.
+  docker:
+    enabled: true
+    endpoint: unix:///var/run/docker.sock
+    networks:
+      - example.com
+    resync_every: 1m
+
+api:
+  listen: 0.0.0.0:5555
+  token: compose-token
+
+bootstrap:
+  file: /etc/ldap-kdc/bootstrap.yaml

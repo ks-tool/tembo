@@ -4,7 +4,8 @@
 #
 #   docker compose -f docker-compose.yaml -f docker-compose.ext.yaml up -d --build
 #
-# The KDC and OpenBao are built from the ldap-kdc repository next to this one (../ldap-kdc).
+# The KDC is the published ldap-kdc image; its configuration, the krb5.conf and the OpenBao build
+# context are copies in stand/ (see stand/README.md), so the stand runs from this repository alone.
 # Everything here is a stand: the KDC's management token and the root token in the bao-keys volume
 # are for throwaway use only.
 #
@@ -44,13 +45,15 @@ x-stand-node: &stand-node
       condition: service_completed_successfully
   volumes:
     - ./stand/node-start.sh:/stand/node-start.sh:ro
-    - ../ldap-kdc/compose/krb5.conf:/etc/krb5.conf:ro
+    - ./stand/krb5.conf:/etc/krb5.conf:ro
     - bao-keys:/bao:ro
   command: [ run, --consul, "http://consul:8500", --consul-expect, "3" ]
 
 services:
   consul:
     image: hashicorp/consul:1.21
+    # Named for the zone: the KDC registers the container as consul.example.com.
+    container_name: consul
     command: agent -dev -client=0.0.0.0
     networks:
       stand:
@@ -63,11 +66,12 @@ services:
       retries: 12
 
   ldap-kdc:
-    build:
-      context: ../ldap-kdc
-      args:
-        VERSION: compose
-    image: ldap-kdc:compose
+    image: ghcr.io/shulutkov/ldap-kdc:1.11.0
+    container_name: ldap-kdc
+    # The service reads the container list and events from the Docker socket; it runs as an
+    # unprivileged user and gets the socket's group, which is 0 on Docker Desktop (stat -c %g).
+    group_add:
+      - "0"
     # The process runs unprivileged and still binds 53, 88, 389 and 464.
     sysctls:
       net.ipv4.ip_unprivileged_port_start: "0"
@@ -78,21 +82,27 @@ services:
           - kdc.example.com
     volumes:
       - ldap-kdc-data:/var/lib/ldap-kdc
-      - ../ldap-kdc/compose/ldap-kdc.yaml:/etc/ldap-kdc/ldap-kdc.yaml:ro
-      - ../ldap-kdc/compose/bootstrap.yaml:/etc/ldap-kdc/bootstrap.yaml:ro
+      - ./stand/ldap-kdc/ldap-kdc.yaml:/etc/ldap-kdc/ldap-kdc.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./stand/ldap-kdc/bootstrap.yaml:/etc/ldap-kdc/bootstrap.yaml:ro
     ports:
       - "127.0.0.1:5555:5555" # management API, token compose-token
       - "127.0.0.1:88:88"
 
   kdc-init:
-    image: alpine:3.20
+    # curl is in the image: the containers resolve through the KDC, which does not forward, so
+    # nothing can be installed at run time.
+    image: curlimages/curl:latest
+    # The keytabs are written to volumes owned by root.
+    user: root
     depends_on:
       ldap-kdc:
         condition: service_started
     networks:
       stand:
-    command: [ "sh", "-c", "apk add --no-cache curl >/dev/null && /stand/kdc-init.sh" ]
+    entrypoint: [ "/bin/sh", "/stand/kdc-init.sh" ]
     volumes:
+      - ./stand/resolv.conf:/etc/resolv.conf:ro
       - ./stand/kdc-init.sh:/stand/kdc-init.sh:ro
       - krb-tembo-a:/out/tembo-a
       - krb-tembo-b:/out/tembo-b
@@ -101,8 +111,9 @@ services:
     restart: "no"
 
   openbao:
+    container_name: openbao
     build:
-      context: ../ldap-kdc/test/e2e/testdata
+      context: ./stand/openbao
       dockerfile: Dockerfile.openbao
     image: tembo-openbao:stand
     # The image's own configuration: in-memory storage, a PKCS#11 seal against SoftHSM. Not the
@@ -128,6 +139,7 @@ services:
       TEMBO_PG_PASSWORD: ${TEMBO_PG_PASSWORD:-tembo}
     entrypoint: [ "/stand/openbao-init.sh" ]
     volumes:
+      - ./stand/resolv.conf:/etc/resolv.conf:ro
       - ./stand/openbao-init.sh:/stand/openbao-init.sh:ro
       - bao-keys:/bao
     restart: "no"
@@ -148,7 +160,8 @@ services:
           - tembo-a.example.com
     volumes:
       - ./stand/node-start.sh:/stand/node-start.sh:ro
-      - ../ldap-kdc/compose/krb5.conf:/etc/krb5.conf:ro
+      - ./stand/krb5.conf:/etc/krb5.conf:ro
+      - ./stand/resolv.conf:/etc/resolv.conf:ro
       - bao-keys:/bao:ro
       - krb-tembo-a:/krb:ro
       - tembo-a:/var/lib/postgresql
@@ -179,7 +192,8 @@ services:
           - tembo-b.example.com
     volumes:
       - ./stand/node-start.sh:/stand/node-start.sh:ro
-      - ../ldap-kdc/compose/krb5.conf:/etc/krb5.conf:ro
+      - ./stand/krb5.conf:/etc/krb5.conf:ro
+      - ./stand/resolv.conf:/etc/resolv.conf:ro
       - bao-keys:/bao:ro
       - krb-tembo-b:/krb:ro
       - tembo-b:/var/lib/postgresql
@@ -210,7 +224,8 @@ services:
           - tembo-c.example.com
     volumes:
       - ./stand/node-start.sh:/stand/node-start.sh:ro
-      - ../ldap-kdc/compose/krb5.conf:/etc/krb5.conf:ro
+      - ./stand/krb5.conf:/etc/krb5.conf:ro
+      - ./stand/resolv.conf:/etc/resolv.conf:ro
       - bao-keys:/bao:ro
       - krb-tembo-c:/krb:ro
       - tembo-c:/var/lib/postgresql
@@ -225,8 +240,10 @@ services:
       - "5436:5432"
       - "5438:5434"
 
-# The network is named after the realm's DNS domain on purpose: Docker's reverse DNS answers
-# <container>.<network>, so each node's address reverses to the name its Kerberos principal has.
+# ldap-kdc registers every container of the example.com network in its zone (dns.docker in
+# stand/ldap-kdc/ldap-kdc.yaml): consul.example.com, openbao.example.com, tembo-a.example.com, and so
+# on. The containers resolve through the KDC (stand/resolv.conf), which answers their reverse
+# lookups from those records, so a node's address reverses to the name its principal has.
 networks:
   stand:
     name: example.com
