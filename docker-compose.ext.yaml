@@ -1,22 +1,59 @@
-# The same three-node tembo cluster as in docker-compose.yaml, but with
-# Consul service discovery instead of the static --peers list. Run the two
-# files together:
+# The three-node tembo cluster of docker-compose.yaml, extended into a Kerberos stand: Consul
+# service discovery instead of the static --peers list, OpenBao for the Postgres password, and
+# ldap-kdc as the KDC. Run the files together:
 #
-#   docker compose -f docker-compose.yaml -f docker-compose.ext.yaml up -d
+#   docker compose -f docker-compose.yaml -f docker-compose.ext.yaml up -d --build
 #
-# Every node registers itself in Consul (service "tembo", a TCP health check
-# against its API port) and discovers the peers from the catalog. The node
-# ids are the same as in the base file — tembo_a, tembo_b, tembo_c, from the
-# hostnames — and travel in the tembo_id metadata. --consul-expect 3 makes
-# each node wait for the full set before bootstrapping; the advertise
-# address is the default, the hostname at port 8001, which the service
-# names resolve to. Nodes added later join with `tembo members add` as
-# usual; see docs/operations.md (Consul discovery).
+# The KDC and OpenBao are built from the ldap-kdc repository next to this one (../ldap-kdc).
+# Everything here is a stand: the KDC's management token and the root token in the bao-keys volume
+# are for throwaway use only.
+#
+# Nodes are tembo-a/b/c.example.com (fixed addresses 10.99.0.11-13 in the stand subnet, the KDC at
+# 10.99.0.10, OpenBao at 10.99.0.20). Each one:
+#   - logs its API clients in with SPNEGO, principal HTTP/<node>, keytab in /krb/node.keytab;
+#   - runs `tembo shell` as the Kerberos caller through S4U2Self/S4U2Proxy, to postgres/<node>;
+#   - authenticates Postgres connections with gss, and replicates as the principal tembo_repl;
+#   - reads the cluster password from OpenBao, secret tembo/pg.
+#
+# Connect with a Kerberos ticket, from inside the stand's network (the API answers only to
+# Negotiate on the node names):
+#   docker compose exec tembo-a tembo --addr tembo-a.example.com:8001 --krb5-keytab /krb/node.keytab \
+#       --krb5-principal HTTP/tembo-a.example.com@EXAMPLE.COM status
+# The client keytab for alice is in the krb-client volume (/out/client/alice.keytab from kdc-init).
+
+x-stand-env: &stand-env
+  TEMBO_BAO_ADDRESS: http://openbao:8200
+  TEMBO_BAO_TOKEN_FILE: /bao/root-token
+  TEMBO_BAO_PASSWORD_PATH: tembo/pg
+  TEMBO_AUTH_KRB5_KEYTAB: /krb/node.keytab
+  TEMBO_PG_KRB5_KEYTAB: /krb/node.keytab
+  TEMBO_PG_KRB5_PRINCIPAL: postgres
+  TEMBO_PG_HOST_AUTH: gss
+  TEMBO_PG_HOST_AUTH_OPTS: include_realm=0 map=tembo
+
+x-stand-node: &stand-node
+  entrypoint: [ "/stand/node-start.sh" ]
+  networks:
+    stand:
+  depends_on:
+    consul:
+      condition: service_healthy
+    openbao-init:
+      condition: service_completed_successfully
+    kdc-init:
+      condition: service_completed_successfully
+  volumes:
+    - ./stand/node-start.sh:/stand/node-start.sh:ro
+    - ../ldap-kdc/compose/krb5.conf:/etc/krb5.conf:ro
+    - bao-keys:/bao:ro
+  command: [ run, --consul, "http://consul:8500", --consul-expect, "3" ]
 
 services:
   consul:
     image: hashicorp/consul:1.21
     command: agent -dev -client=0.0.0.0
+    networks:
+      stand:
     ports:
       - "8500:8500" # UI / API
     healthcheck:
@@ -25,20 +62,186 @@ services:
       timeout: 5s
       retries: 12
 
-  tembo-a:
+  ldap-kdc:
+    build:
+      context: ../ldap-kdc
+      args:
+        VERSION: compose
+    image: ldap-kdc:compose
+    # The process runs unprivileged and still binds 53, 88, 389 and 464.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    networks:
+      stand:
+        ipv4_address: 10.99.0.10
+        aliases:
+          - kdc.example.com
+    volumes:
+      - ldap-kdc-data:/var/lib/ldap-kdc
+      - ../ldap-kdc/compose/ldap-kdc.yaml:/etc/ldap-kdc/ldap-kdc.yaml:ro
+      - ../ldap-kdc/compose/bootstrap.yaml:/etc/ldap-kdc/bootstrap.yaml:ro
+    ports:
+      - "127.0.0.1:5555:5555" # management API, token compose-token
+      - "127.0.0.1:88:88"
+
+  kdc-init:
+    image: alpine:3.20
     depends_on:
-      consul:
-        condition: service_healthy
-    command: [ run, --consul, "http://consul:8500", --consul-expect, "3" ]
+      ldap-kdc:
+        condition: service_started
+    networks:
+      stand:
+    command: [ "sh", "-c", "apk add --no-cache curl >/dev/null && /stand/kdc-init.sh" ]
+    volumes:
+      - ./stand/kdc-init.sh:/stand/kdc-init.sh:ro
+      - krb-tembo-a:/out/tembo-a
+      - krb-tembo-b:/out/tembo-b
+      - krb-tembo-c:/out/tembo-c
+      - krb-client:/out/client
+    restart: "no"
+
+  openbao:
+    build:
+      context: ../ldap-kdc/test/e2e/testdata
+      dockerfile: Dockerfile.openbao
+    image: tembo-openbao:stand
+    # The image's own configuration: in-memory storage, a PKCS#11 seal against SoftHSM. Not the
+    # image's default dev mode.
+    command: [ "server", "-config=/openbao/config.hcl" ]
+    networks:
+      stand:
+        ipv4_address: 10.99.0.20
+        aliases:
+          - openbao
+    ports:
+      - "127.0.0.1:8200:8200" # API
+
+  openbao-init:
+    image: tembo-openbao:stand
+    user: root
+    depends_on:
+      openbao:
+        condition: service_started
+    networks:
+      stand:
+    environment:
+      TEMBO_PG_PASSWORD: ${TEMBO_PG_PASSWORD:-tembo}
+    entrypoint: [ "/stand/openbao-init.sh" ]
+    volumes:
+      - ./stand/openbao-init.sh:/stand/openbao-init.sh:ro
+      - bao-keys:/bao
+    restart: "no"
+
+  tembo-a:
+    <<: *stand-node
+    # Docker's reverse DNS answers with <container name>.<network name>: the network is
+    # example.com, so the address of this node reverses to tembo-a.example.com.
+    container_name: tembo-a
+    hostname: tembo-a.example.com
+    # The id names the replication slot, so it cannot carry the domain.
+    command: [ run, --id, tembo_a, --consul, "http://consul:8500", --consul-expect, "3" ]
+    user: postgres
+    networks:
+      stand:
+        ipv4_address: 10.99.0.11
+        aliases:
+          - tembo-a.example.com
+    volumes:
+      - ./stand/node-start.sh:/stand/node-start.sh:ro
+      - ../ldap-kdc/compose/krb5.conf:/etc/krb5.conf:ro
+      - bao-keys:/bao:ro
+      - krb-tembo-a:/krb:ro
+      - tembo-a:/var/lib/postgresql
+    environment:
+      <<: *stand-env
+      TEMBO_PG_DATA: /var/lib/postgresql/data
+      TEMBO_DB: /var/lib/postgresql/tembo.db
+      TEMBO_SHELL_KRB5_SPN: postgres/tembo-a.example.com
+      TEMBO_SHELL_KRB5_PRINCIPAL: HTTP/tembo-a.example.com@EXAMPLE.COM
+    ports:
+      - "8001:8001"
+      - "5432:5432"
+      - "5434:5434"
 
   tembo-b:
-    depends_on:
-      consul:
-        condition: service_healthy
-    command: [ run, --consul, "http://consul:8500", --consul-expect, "3" ]
+    <<: *stand-node
+    # Docker's reverse DNS answers with <container name>.<network name>: the network is
+    # example.com, so the address of this node reverses to tembo-b.example.com.
+    container_name: tembo-b
+    hostname: tembo-b.example.com
+    # The id names the replication slot, so it cannot carry the domain.
+    command: [ run, --id, tembo_b, --consul, "http://consul:8500", --consul-expect, "3" ]
+    user: postgres
+    networks:
+      stand:
+        ipv4_address: 10.99.0.12
+        aliases:
+          - tembo-b.example.com
+    volumes:
+      - ./stand/node-start.sh:/stand/node-start.sh:ro
+      - ../ldap-kdc/compose/krb5.conf:/etc/krb5.conf:ro
+      - bao-keys:/bao:ro
+      - krb-tembo-b:/krb:ro
+      - tembo-b:/var/lib/postgresql
+    environment:
+      <<: *stand-env
+      TEMBO_PG_DATA: /var/lib/postgresql/data
+      TEMBO_DB: /var/lib/postgresql/tembo.db
+      TEMBO_SHELL_KRB5_SPN: postgres/tembo-b.example.com
+      TEMBO_SHELL_KRB5_PRINCIPAL: HTTP/tembo-b.example.com@EXAMPLE.COM
+    ports:
+      - "8002:8001"
+      - "5433:5432"
+      - "5435:5434"
 
   tembo-c:
-    depends_on:
-      consul:
-        condition: service_healthy
-    command: [ run, --consul, "http://consul:8500", --consul-expect, "3" ]
+    <<: *stand-node
+    # Docker's reverse DNS answers with <container name>.<network name>: the network is
+    # example.com, so the address of this node reverses to tembo-c.example.com.
+    container_name: tembo-c
+    hostname: tembo-c.example.com
+    # The id names the replication slot, so it cannot carry the domain.
+    command: [ run, --id, tembo_c, --consul, "http://consul:8500", --consul-expect, "3" ]
+    user: postgres
+    networks:
+      stand:
+        ipv4_address: 10.99.0.13
+        aliases:
+          - tembo-c.example.com
+    volumes:
+      - ./stand/node-start.sh:/stand/node-start.sh:ro
+      - ../ldap-kdc/compose/krb5.conf:/etc/krb5.conf:ro
+      - bao-keys:/bao:ro
+      - krb-tembo-c:/krb:ro
+      - tembo-c:/var/lib/postgresql
+    environment:
+      <<: *stand-env
+      TEMBO_PG_DATA: /var/lib/postgresql/data
+      TEMBO_DB: /var/lib/postgresql/tembo.db
+      TEMBO_SHELL_KRB5_SPN: postgres/tembo-c.example.com
+      TEMBO_SHELL_KRB5_PRINCIPAL: HTTP/tembo-c.example.com@EXAMPLE.COM
+    ports:
+      - "8003:8001"
+      - "5436:5432"
+      - "5438:5434"
+
+# The network is named after the realm's DNS domain on purpose: Docker's reverse DNS answers
+# <container>.<network>, so each node's address reverses to the name its Kerberos principal has.
+networks:
+  stand:
+    name: example.com
+    ipam:
+      config:
+        - subnet: 10.99.0.0/24
+          gateway: 10.99.0.1
+
+volumes:
+  ldap-kdc-data:
+  bao-keys:
+  krb-tembo-a:
+  krb-tembo-b:
+  krb-tembo-c:
+  krb-client:
+  tembo-a:
+  tembo-b:
+  tembo-c:

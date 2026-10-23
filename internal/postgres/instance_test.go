@@ -140,11 +140,29 @@ func TestHBAAuthMethods(t *testing.T) {
 		}
 	}
 
-	// gss, without options
+	// gss, without options: ordinary connections by Kerberos, replication by
+	// tembo_repl's password, on a line of its own
 	i = &Instance{Hosts: []string{"10.0.0.1"}, HostAuth: "gss"}
 	hba = string(i.hba())
-	if !strings.Contains(hba, "host all all 10.0.0.1/32 gss\n") {
-		t.Errorf("pg_hba.conf has no gss line:\n%s", hba)
+	for _, want := range []string{
+		"host all all 10.0.0.1/32 gss\n",
+		"host replication tembo_repl 10.0.0.1/32 scram-sha-256\n",
+	} {
+		if !strings.Contains(hba, want) {
+			t.Errorf("pg_hba.conf has no %q:\n%s", want, hba)
+		}
+	}
+
+	// gss options go to the Kerberos line only; the replication line takes none
+	i = &Instance{Hosts: []string{"10.0.0.1"}, HostAuth: "gss", HostAuthOpts: "include_realm=0 map=tembo"}
+	hba = string(i.hba())
+	for _, want := range []string{
+		"host all all 10.0.0.1/32 gss include_realm=0 map=tembo\n",
+		"host replication tembo_repl 10.0.0.1/32 scram-sha-256\n",
+	} {
+		if !strings.Contains(hba, want) {
+			t.Errorf("pg_hba.conf has no %q:\n%s", want, hba)
+		}
 	}
 
 	// a TCP line for the agent appears when it does not use the socket; its
@@ -219,5 +237,25 @@ func TestWipeDataKeepsDirectory(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("got %v, %v, want an empty directory", entries, err)
+	}
+}
+
+// Under gss the primary_conninfo of a standby is the replication role's
+// password connection; the superuser-capable connection keeps Kerberos.
+func TestReplConninfoIsPasswordUnderGSS(t *testing.T) {
+	i := &Instance{Port: 5433, HostAuth: "gss", Password: "secret"}
+	conninfo, err := i.replConninfo("db1")
+	if err != nil {
+		t.Fatalf("replConninfo: %v", err)
+	}
+	if !strings.Contains(conninfo, "user=tembo_repl") || !strings.Contains(conninfo, "password='secret'") {
+		t.Fatalf("replication conninfo under gss: %q", conninfo)
+	}
+	gssConn, err := i.conninfo("db1")
+	if err != nil {
+		t.Fatalf("conninfo: %v", err)
+	}
+	if strings.Contains(gssConn, "password=") {
+		t.Fatalf("gss conninfo carries a password: %q", gssConn)
 	}
 }

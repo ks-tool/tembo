@@ -71,8 +71,8 @@ func (i *Instance) ensureRoles(ctx context.Context) error {
 			return err
 		}
 		var ddl string
-		if i.HostAuth == "ldap" || i.HostAuth == "gss" {
-			// LDAP and Kerberos authenticate the role; it has no password.
+		if i.HostAuth == "ldap" {
+			// LDAP authenticates the role; it has no password.
 			ddl = fmt.Sprintf("create role %s with login replication", replUser)
 		} else {
 			password, err := i.password()

@@ -71,7 +71,7 @@ type runConfig struct {
 	PGPassword               string   `env:"PG_PASSWORD" flag:"pg-password" help:"Postgres superuser password, the same on every node; --pg-password-file is the file variant, --pg-password wins"`
 	PGPasswordFile           string   `env:"PG_PASSWORD_FILE" flag:"pg-password-file" help:"file with the Postgres superuser password, the same on every node (or --pg-password)"`
 	PGLocalAuth              string   `env:"PG_LOCAL_AUTH" flag:"pg-local-auth" help:"how the agent connects to Postgres: peer (the Unix socket), password or gss (Kerberos)"`
-	PGHostAuth               string   `env:"PG_HOST_AUTH" flag:"pg-host-auth" help:"authentication of the nodes' pg_hba lines: scram-sha-256, ldap or gss"`
+	PGHostAuth               string   `env:"PG_HOST_AUTH" flag:"pg-host-auth" help:"authentication of the nodes' pg_hba lines: scram-sha-256, ldap or gss; under gss, replication still runs on tembo_repl's password"`
 	PGHostAuthOpts           string   `env:"PG_HOST_AUTH_OPTS" flag:"pg-host-auth-opts" help:"verbatim options of the --pg-host-auth method, e.g. \"ldapbasedn=... ldapbinddn=...\""`
 	PGKrb5Keytab             string   `env:"PG_KRB5_KEYTAB" flag:"pg-krb5-keytab" help:"keytab the agent's Kerberos tickets come from (default: the credential cache)"`
 	PGKrb5Config             string   `env:"PG_KRB5_CONFIG" flag:"pg-krb5-config" help:"krb5.conf for the agent and the Postgres processes (default: $KRB5_CONFIG or /etc/krb5.conf)"`

@@ -79,7 +79,7 @@ local all all peer                                  # the agent, over the socket
 local replication postgres peer                     # local pg_basebackup (/backup)
 host all postgres 127.0.0.1/32 <method>             # only with --pg-local-auth password|gss
 host all all <node-address-1> <method>              # one pair per cluster node,
-host replication tembo_repl <node-address-1> <method>   # resolved names included
+host replication tembo_repl <node-address-1> <method>   # resolved names included; scram-sha-256 under gss
 ...
 <hba setting lines, verbatim>                       # yours, via settings set-hba
 ```
@@ -137,15 +137,17 @@ Two independent knobs:
 
 Standbys, slot sync and `pg_basebackup` connect as the role **`tembo_repl`**
 (`login replication`), which the primary creates itself — with the shared
-password in the default setup, without one under LDAP/GSS host
-authentication. The superuser stays local: the Unix socket and `pg_rewind`,
+password in the default setup, and without one under LDAP host
+authentication. Under `gss` it has a password too: the replication lines of
+`pg_hba.conf` are `scram-sha-256` records of their own, and carry none of the
+gss options. The superuser stays local: the Unix socket and `pg_rewind`,
 which needs it. The `tembo_repl` password is the superuser's —
 `TEMBO_PG_PASSWORD` (or `--pg-password-file`) at bootstrap, and afterwards
 whatever the cluster last rotated to with
 [`tembo rotate-password`](cli.md#rotate-password--rotate-the-cluster-password):
 the rotation commits through raft, every agent starts using it within a
 second or two, the primary alters the roles that hold one — `postgres`
-always, `tembo_repl` only where the host authentication is password-based —
+always, `tembo_repl` wherever it has a password (not under LDAP) —
 with `ALTER ROLE ... PASSWORD`, and the standbys receive the change by WAL
 replay. The startup password counts
 as applied, so a cluster that never rotated has its roles altered by no one.
@@ -160,9 +162,11 @@ password of the API authentication.
 With `gss` anywhere, the agent obtains its tickets from
 `--pg-krb5-keytab` (or the credential cache), uses
 `--pg-krb5-principal` (default `postgres`) and the `krb5.conf` of
-`--pg-krb5-config`, and exports `KRB5_KTNAME`/
-`KRB5_CONFIG` to the Postgres processes (walreceiver, pg_basebackup,
-pg_rewind) so libpq finds the same credentials. Constraint pairs:
+`--pg-krb5-config`, and exports `KRB5_KTNAME`/`KRB5_CONFIG` to the Postgres
+processes so libpq finds the same keys. Ordinary connections of the nodes —
+and the superuser connections of `pg_rewind` and slot creation — authenticate
+with those tickets. Replication does not: `pg_basebackup` and the standbys'
+`primary_conninfo` use `tembo_repl`'s password. Constraint pairs:
 `password` local auth needs a password-based host auth; `gss` local auth
 needs `gss` host auth.
 

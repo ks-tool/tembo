@@ -430,9 +430,10 @@ func (i *Instance) hba() []byte {
 		// The agent connects over TCP then; its line follows the nodes' method.
 		_, _ = fmt.Fprintf(&b, "host all %s 127.0.0.1/32 %s\n", superuser, method)
 	}
+	repl := i.replMethod()
 	for _, a := range slices.Sorted(maps.Keys(addresses)) {
 		_, _ = fmt.Fprintf(&b, "host all all %s %s\n", a, method)
-		_, _ = fmt.Fprintf(&b, "host replication %s %s %s\n", replUser, a, method)
+		_, _ = fmt.Fprintf(&b, "host replication %s %s %s\n", replUser, a, repl)
 	}
 	for _, line := range extra {
 		b.WriteString(line + "\n")
@@ -453,6 +454,17 @@ func (i *Instance) hostAuth() string {
 	return method
 }
 
+// replMethod is the method of the replication lines of pg_hba.conf. Under gss
+// the ordinary connections authenticate Kerberos principals, but replication
+// runs on tembo_repl's password: a record of its own with scram-sha-256, which
+// takes none of the gss options.
+func (i *Instance) replMethod() string {
+	if i.HostAuth == "gss" {
+		return "scram-sha-256"
+	}
+	return i.hostAuth()
+}
+
 // single is how a lone address is written in pg_hba.conf: without a mask the
 // next word is read as one, "address mask auth-method" being a valid line.
 func single(ip net.IP) string {
@@ -467,7 +479,7 @@ func single(ip net.IP) string {
 // field order its own — so the strings are compared as the connections they
 // parse to, not as text.
 func (i *Instance) Follows(primaryHost, conninfo string) bool {
-	want, err := i.conninfo(primaryHost)
+	want, err := i.replConninfo(primaryHost)
 	if err != nil || conninfo == "" {
 		return false
 	}
@@ -660,11 +672,10 @@ func (i *Instance) createData(ctx context.Context, upstreamHost string, cloneSlo
 			args = append(args, "--slot", i.slotName())
 		}
 		cmd := i.command(ctx, "pg_basebackup", args...)
+		// Replication runs on tembo_repl's password, under gss as well.
+		cmd.SetEnv("PGPASSWORD", password)
 		if i.HostAuth == "gss" {
-			// libpq authenticates with Kerberos instead of a password.
 			i.krb5Env(cmd)
-		} else {
-			cmd.SetEnv("PGPASSWORD", password)
 		}
 		if err = cmd.Run(); err != nil {
 			return fmt.Errorf("pg_basebackup from %s: %w", upstreamHost, err)
@@ -780,7 +791,7 @@ func (i *Instance) configure(primaryHost string, slot bool) error {
 	maps.Copy(conf, logSettings(i.LogDir))
 	conf["port"] = strconv.Itoa(i.Port)
 	if primaryHost != "" {
-		conninfo, err := i.conninfo(primaryHost)
+		conninfo, err := i.replConninfo(primaryHost)
 		if err != nil {
 			return err
 		}
@@ -816,6 +827,12 @@ func (i *Instance) conninfo(primaryHost string) (string, error) {
 		return fmt.Sprintf("host=%s port=%d user=%s dbname=postgres application_name=%s",
 			primaryHost, i.Port, replUser, i.ID), nil
 	}
+	return i.replConninfo(primaryHost)
+}
+
+// replConninfo is the connection of the replication role tembo_repl with its
+// password: what primary_conninfo and pg_basebackup use, under gss as well.
+func (i *Instance) replConninfo(primaryHost string) (string, error) {
 	password, err := i.password()
 	if err != nil {
 		return "", err
@@ -889,7 +906,7 @@ func (i *Instance) ApplyPassword(ctx context.Context) error {
 	quoted := strings.ReplaceAll(pw, "'", "''")
 	err := i.query(ctx, func(ctx context.Context, conn *pgx.Conn) error {
 		roles := []string{superuser}
-		if i.HostAuth != "ldap" && i.HostAuth != "gss" {
+		if i.HostAuth != "ldap" {
 			roles = append(roles, replUser)
 		}
 		for _, role := range roles {
