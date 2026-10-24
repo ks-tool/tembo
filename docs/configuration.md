@@ -133,6 +133,10 @@ The API port is not a flag: the agent listens on the port of this node's own
 | `--pg-password-file` | `TEMBO_PG_PASSWORD_FILE` | —       | File whose first line is the superuser password — the file variant of `--pg-password`; one of the two is required.                                                                               |
 | `--initdb-args`      | `TEMBO_INITDB_ARGS`      | —       | Extra arguments for `initdb` of a new cluster, e.g. `"--data-checksums"`.                                                                                                                        |
 | `--clone-command`    | `TEMBO_CLONE_COMMAND`    | —       | Shell command that clones the primary instead of `pg_basebackup`. Gets `TEMBO_PGDATA`, `TEMBO_PRIMARY_HOST`, `TEMBO_PRIMARY_PORT`, `PGPASSWORD` — the entry point for wal-g/pgBackRest restores. |
+| `--backup-s3-bucket` | `TEMBO_BACKUP_S3_BUCKET` | — | S3 bucket the backups go to (`tembo backup --s3`). Enables the S3 backup endpoints. Credentials come from the AWS environment. |
+| `--backup-s3-endpoint` | `TEMBO_BACKUP_S3_ENDPOINT` | AWS | Endpoint of an S3-compatible server, e.g. `http://rustfs:9000`. |
+| `--backup-s3-region` | `TEMBO_BACKUP_S3_REGION` | `us-east-1` | Region of the bucket. |
+| `--backup-s3-path-style` | `TEMBO_BACKUP_S3_PATH_STYLE` | off | Address the bucket in the path, as most S3-compatible servers need. |
 
 ### Postgres authentication
 

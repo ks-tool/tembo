@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ks-tool/tembo/internal/backup"
 	"io"
 	"io/fs"
 	"maps"
@@ -127,6 +128,8 @@ type Instance struct {
 	CloneCmd   string
 	// shell, when set, lets the shell log in as Kerberos users, see shell_krb5.go.
 	shell *shellKerberos
+	// backups, when set, is the S3 bucket backups are written to and restored from.
+	backups *backup.Store
 
 	// LocalAuth is how the agent itself connects to Postgres: "peer" (the
 	// Unix socket), "password" (TCP to 127.0.0.1) or "gss" (TCP + Kerberos).

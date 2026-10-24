@@ -16,6 +16,7 @@ import (
 
 	"github.com/ks-tool/tembo/internal/agent"
 	"github.com/ks-tool/tembo/internal/auth"
+	"github.com/ks-tool/tembo/internal/backup"
 	"github.com/ks-tool/tembo/internal/exec"
 	"github.com/ks-tool/tembo/internal/store"
 
@@ -272,33 +273,117 @@ func opsHandlers(mux *http.ServeMux, st *store.Store, pg *Instance, id string) {
 	// supervise starts postgres with it afterwards. A standby ahead of the
 	// backup heals itself: pg_rewind, or a reclone after its failures.
 	mux.HandleFunc("POST /restore-backup", func(w http.ResponseWriter, r *http.Request) {
-		if state, _, _ := pg.Status(r.Context()); state.Running {
-			ctx, cancel := context.WithTimeout(r.Context(), shutdownTimeout)
-			defer cancel()
-			if err := pg.Stop(ctx, "fast"); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-		if err := pg.wipeData(); err != nil {
+		if err := pg.replaceDataDir(r.Context(), r.Body); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		cmd := exec.New(exec.SetOutput(io.Discard), exec.SetErrOut(newErrLineLog("tar"))).Command(r.Context(), "tar", "-x", "-C", pg.DataDir)
-		cmd.Stdin = r.Body
-		if err := cmd.Run(); err != nil {
-			http.Error(w, fmt.Errorf("untar: %w", err).Error(), http.StatusInternalServerError)
-			return
-		}
-		// tar applies the modes of the archive; postgres wants 0700 or 0750.
-		if err := os.Chmod(pg.DataDir, 0o700); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		pg.setRewindFailures(0)
 		log.Warn().Msg("restore-backup: the data directory is replaced, supervise starts postgres")
 		w.WriteHeader(http.StatusNoContent)
 	})
+
+	// backup-s3 writes a physical backup to the S3 bucket under ?key=, as a tar
+	// streamed into a multipart upload: the tar is never held whole on the node.
+	// pg_basebackup still writes the copy into a directory of its own first,
+	// since a tar to stdout carries no WAL.
+	mux.HandleFunc("POST /backup-s3", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if pg.backups == nil {
+			http.Error(w, "no S3 bucket configured (--backup-s3-bucket)", http.StatusServiceUnavailable)
+			return
+		}
+		if !backup.ValidKey(key) {
+			http.Error(w, "bad backup name", http.StatusBadRequest)
+			return
+		}
+		dir, err := pg.socketDir()
+		if err != nil {
+			http.Error(w, "postgres is not running", http.StatusServiceUnavailable)
+			return
+		}
+		tmp, err := os.MkdirTemp("", "tembo-backup-*")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() { _ = os.RemoveAll(tmp) }()
+		bb := exec.New(exec.SetOutput(newLineLog("pg_basebackup")), exec.SetErrOut(newErrLineLog("pg_basebackup"))).
+			Command(r.Context(), pg.bin("pg_basebackup"),
+				"-D", tmp, "-X", "stream",
+				"-h", dir, "-p", strconv.Itoa(pg.Port), "-U", superuser, "--no-password")
+		if err := bb.Run(); err != nil {
+			http.Error(w, fmt.Errorf("pg_basebackup: %w", err).Error(), http.StatusInternalServerError)
+			return
+		}
+		pr, pw := io.Pipe()
+		tarCmd := exec.New(exec.SetOutput(pw), exec.SetErrOut(newErrLineLog("tar"))).Command(r.Context(), "tar", "-C", tmp, "-c", ".")
+		go func() { _ = pw.CloseWithError(tarCmd.Run()) }()
+		n, err := pg.backups.Put(r.Context(), key, pr)
+		// A failed upload leaves tar with nobody to write to: closing the read end ends it.
+		_ = pr.CloseWithError(err)
+		if err != nil {
+			http.Error(w, fmt.Errorf("upload: %w", err).Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Info().Str("key", key).Int64("bytes", n).Msg("backup-s3: uploaded")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"key": key, "bytes": n})
+	})
+
+	// restore-backup-s3 replaces the data directory with the backup under ?key=,
+	// streamed from the bucket. The object is checked before anything is stopped.
+	mux.HandleFunc("POST /restore-backup-s3", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if pg.backups == nil {
+			http.Error(w, "no S3 bucket configured (--backup-s3-bucket)", http.StatusServiceUnavailable)
+			return
+		}
+		if !backup.ValidKey(key) {
+			http.Error(w, "bad backup name", http.StatusBadRequest)
+			return
+		}
+		body, err := pg.backups.Get(r.Context(), key)
+		if err != nil {
+			if backup.IsNotFound(err) {
+				http.Error(w, "no such backup", http.StatusNotFound)
+				return
+			}
+			http.Error(w, fmt.Errorf("download: %w", err).Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() { _ = body.Close() }()
+		if err := pg.replaceDataDir(r.Context(), body); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Warn().Str("key", key).Msg("restore-backup-s3: the data directory is replaced, supervise starts postgres")
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
+// replaceDataDir stops Postgres, empties the data directory and unpacks the
+// backup tar read from src into it. supervise starts Postgres afterwards.
+func (pg *Instance) replaceDataDir(ctx context.Context, src io.Reader) error {
+	if state, _, _ := pg.Status(ctx); state.Running {
+		stopCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
+		defer cancel()
+		if err := pg.Stop(stopCtx, "fast"); err != nil {
+			return err
+		}
+	}
+	if err := pg.wipeData(); err != nil {
+		return err
+	}
+	cmd := exec.New(exec.SetOutput(io.Discard), exec.SetErrOut(newErrLineLog("tar"))).Command(ctx, "tar", "-x", "-C", pg.DataDir)
+	cmd.Stdin = src
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("untar: %w", err)
+	}
+	// tar applies the modes of the archive; postgres wants 0700 or 0750.
+	if err := os.Chmod(pg.DataDir, 0o700); err != nil {
+		return err
+	}
+	pg.setRewindFailures(0)
+	return nil
 }
 
 // restoreOutputLimit is how much of psql's output /restore keeps: the tail,
@@ -382,13 +467,21 @@ var dumpCmd = &cobra.Command{
 	},
 }
 
+var (
+	backupS3  string
+	restoreS3 string
+)
+
 var backupCmd = &cobra.Command{
-	Use:   "backup",
-	Short: "Stream a physical backup of Postgres to stdout: tembo backup > base.tar",
+	Use:   "backup [--s3 KEY]",
+	Short: "Stream a physical backup of Postgres to stdout, or to the S3 bucket: tembo backup --s3 base.tar",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		ctx, cancel := context.WithTimeout(cmd.Context(), time.Hour)
 		defer cancel()
+		if backupS3 != "" {
+			return call(ctx, http.MethodPost, "/backup-s3?key="+url.QueryEscape(backupS3), nil)
+		}
 		return call(ctx, http.MethodGet, "/backup", nil)
 	},
 }
@@ -410,12 +503,15 @@ var restoreCmd = &cobra.Command{
 }
 
 var restoreBackupCmd = &cobra.Command{
-	Use:   "restore-backup",
-	Short: "Replace the data directory with a backup tar, from stdin: tembo restore-backup < base.tar",
+	Use:   "restore-backup [--s3 KEY]",
+	Short: "Replace the data directory with a backup tar, from stdin or from the S3 bucket: tembo restore-backup --s3 base.tar",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		ctx, cancel := context.WithTimeout(cmd.Context(), time.Hour)
 		defer cancel()
+		if restoreS3 != "" {
+			return call(ctx, http.MethodPost, "/restore-backup-s3?key="+url.QueryEscape(restoreS3), nil)
+		}
 		data, err := request(ctx, http.MethodPost, "/restore-backup", os.Stdin)
 		if err != nil {
 			return err
@@ -426,6 +522,8 @@ var restoreBackupCmd = &cobra.Command{
 }
 
 func init() {
+	backupCmd.Flags().StringVar(&backupS3, "s3", "", "write the backup to the S3 bucket under this name instead of stdout")
+	restoreBackupCmd.Flags().StringVar(&restoreS3, "s3", "", "restore from the S3 bucket object of this name instead of stdin")
 	dumpCmd.Flags().String("db", "", "dump only this database, default is the whole cluster")
 	rootCmd.AddCommand(reinitCmd, restartCmd, reloadCmd, healthCmd, historyCmd, dumpCmd, backupCmd, restoreCmd, restoreBackupCmd)
 }

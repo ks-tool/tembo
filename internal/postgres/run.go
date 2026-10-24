@@ -26,6 +26,7 @@ import (
 	"github.com/ks-tool/tembo/internal/agent"
 	"github.com/ks-tool/tembo/internal/audit"
 	"github.com/ks-tool/tembo/internal/auth"
+	"github.com/ks-tool/tembo/internal/backup"
 	"github.com/ks-tool/tembo/internal/metrics"
 	"github.com/ks-tool/tembo/internal/proxy"
 	"github.com/ks-tool/tembo/internal/store"
@@ -109,6 +110,10 @@ type runConfig struct {
 	AuthKrb5Keytab           string   `env:"AUTH_KRB5_KEYTAB" flag:"auth-krb5-keytab" help:"keytab of the API's Kerberos principal, enables SPNEGO"`
 	ShellKrb5SPN             string   `env:"SHELL_KRB5_SPN" flag:"shell-krb5-spn" help:"Postgres service the shell impersonates Kerberos users to, e.g. postgres/db.example.com; needs --auth-krb5-keytab and --shell-krb5-principal"`
 	ShellKrb5Principal       string   `env:"SHELL_KRB5_PRINCIPAL" flag:"shell-krb5-principal" help:"the agent's own principal user@REALM for S4U, whose key is in --auth-krb5-keytab"`
+	BackupS3Bucket           string   `env:"BACKUP_S3_BUCKET" flag:"backup-s3-bucket" help:"S3 bucket the backups go to (tembo backup --s3 KEY); credentials from the AWS environment"`
+	BackupS3Endpoint         string   `env:"BACKUP_S3_ENDPOINT" flag:"backup-s3-endpoint" help:"endpoint of an S3-compatible server, e.g. http://minio:9000 (default: AWS)"`
+	BackupS3Region           string   `env:"BACKUP_S3_REGION" flag:"backup-s3-region" help:"region of the bucket (default us-east-1)"`
+	BackupS3PathStyle        bool     `env:"BACKUP_S3_PATH_STYLE" flag:"backup-s3-path-style" help:"address the bucket in the path, as most S3-compatible servers need"`
 	AuthLDAPURL              string   `env:"AUTH_LDAP_URL" flag:"auth-ldap-url" help:"LDAP server (ldap:// or ldaps://) to authenticate Basic auth against"`
 	AuthLDAPDNTemplate       string   `env:"AUTH_LDAP_DN_TEMPLATE" flag:"auth-ldap-dn-template" help:"direct bind: DN template with %s for the username"`
 	AuthLDAPBindDN           string   `env:"AUTH_LDAP_BIND_DN" flag:"auth-ldap-bind-dn" help:"search-bind: DN to bind with"`
@@ -412,6 +417,16 @@ func runCmdRun(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	if rc.BackupS3Bucket != "" {
+		store, err := backup.Open(cmd.Context(), backup.Options{
+			Bucket: rc.BackupS3Bucket, Endpoint: rc.BackupS3Endpoint, Region: rc.BackupS3Region,
+			PathStyle: rc.BackupS3PathStyle,
+		})
+		if err != nil {
+			return fmt.Errorf("backup: %w", err)
+		}
+		pg.backups = store
+	}
 	if rc.ShellKrb5SPN != "" {
 		if rc.AuthKrb5Keytab == "" {
 			return errors.New("--shell-krb5-spn needs --auth-krb5-keytab")

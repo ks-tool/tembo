@@ -147,6 +147,9 @@ Three layers, all streaming over the API:
   `pg_basebackup -X stream` (WAL included) tarred. Restore on a node with
   `tembo restore-backup < base.tar`; a standby ahead of the backup heals
   with `pg_rewind`.
+- **Physical, to S3**: `tembo backup --s3 <key>` writes the same tar to the bucket of
+  `--backup-s3-bucket`, streamed into a multipart upload; `tembo restore-backup --s3 <key>` reads
+  it back. See [cli.md](cli.md#backup--restore-backup--physical-backups).
 - **External clones**: point `--clone-command` at wal-g/pgBackRest and a
   reinit/rejoin restores through your existing tooling.
 

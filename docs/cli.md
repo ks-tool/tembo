@@ -253,9 +253,25 @@ itself.
 ```sh
 tembo backup > base.tar                # pg_basebackup -X stream, tar of the data dir + WAL
 tembo --addr 10.0.0.3:8001 restore-backup < base.tar
+
+tembo backup --s3 nodes/a/base.tar     # straight to the S3 bucket of the node: {"key":...,"bytes":...}
+tembo restore-backup --s3 nodes/a/base.tar   # from the bucket; 404 when there is no such object
 ```
 
 `restore-backup` stops the node's Postgres, replaces the data directory with
 the archive and lets `supervise` start it. A standby that is ahead of the
 backup heals itself with `pg_rewind` (or a reclone after repeated rewind
 failures).
+
+Restoring the primary of a running cluster leaves its standbys on the history they had, ahead of
+the restored data: they do not heal on their own. Reclone each of them with `tembo reinit` (on the
+standby node), after which they stream from the restored primary again.
+
+With `--s3` the node writes the backup to the bucket of `--backup-s3-bucket` as it
+is produced: the tar is streamed into a multipart upload in parts of 64 MiB,
+so it is never held whole on the node. `pg_basebackup` still
+writes the copy into a directory of its own on the node first: a tar on stdout carries no WAL, so
+the node needs free space for one copy of the data directory. The name is the object key; it must
+be made of letters, digits, `.`, `_`, `-` and `/`. Restore from S3 checks that the object exists
+before stopping Postgres. Credentials come from the AWS environment (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, a profile, or an instance role).
